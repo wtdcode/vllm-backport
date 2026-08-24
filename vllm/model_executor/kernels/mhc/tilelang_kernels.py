@@ -654,6 +654,68 @@ def mhc_fused_tilelang(
 @tilelang.jit(
     pass_configs=pass_configs,
 )
+def mhc_post_int8_tilelang(
+    a,
+    b,
+    c,
+    d_q,
+    d_s,
+    x,
+    hc: int,
+    hidden: int,
+    blk: int = 32,
+    n_thr: int = 128,
+    h_blk: int = 1024,
+) -> tilelang.JITKernel:
+    """Run mHC post while reading a blockwise-int8 layer output."""
+    n = T.dynamic("num_tokens")
+    h = hidden
+
+    h_blk = math.gcd(hidden, h_blk)
+    a: T.Tensor((n, hc, hc), T.float32)  # type: ignore[no-redef, valid-type]
+    b: T.Tensor((n, hc, h), T.bfloat16)  # type: ignore[no-redef, valid-type]
+    c: T.Tensor((n, hc), T.float32)  # type: ignore[no-redef, valid-type]
+    d_q: T.Tensor((n, h), T.int8)  # type: ignore[no-redef, valid-type]
+    d_s: T.Tensor((n, h // blk), T.bfloat16)  # type: ignore[no-redef, valid-type]
+    x: T.Tensor((n, hc, h), T.bfloat16)  # type: ignore[no-redef, valid-type]
+    with T.Kernel(n, threads=n_thr) as i_n:
+        b_shared = T.alloc_shared((hc, h_blk), T.bfloat16)
+        dq_shared = T.alloc_shared(h_blk, T.int8)
+        ds_shared = T.alloc_shared(h_blk // blk, T.bfloat16)
+
+        x_local = T.alloc_fragment((hc, h_blk), T.float32)
+        b_local = T.alloc_fragment((hc, h_blk), T.float32)
+        d_local = T.alloc_fragment(h_blk, T.float32)
+
+        a_local = T.alloc_fragment((hc, hc), T.float32)
+        c_local = T.alloc_fragment(hc, T.float32)
+        if ENABLE_PDL:
+            T.pdl_sync()
+        T.copy(a[i_n, 0, 0], a_local)
+        T.copy(c[i_n, 0], c_local)
+
+        for i0_h in T.Serial(T.ceildiv(h, h_blk)):
+            T.copy(b[i_n, 0, i0_h * h_blk], b_shared)
+            T.copy(d_q[i_n, i0_h * h_blk], dq_shared)
+            T.copy(d_s[i_n, i0_h * h_blk // blk], ds_shared)
+
+            T.copy(b_shared, b_local)
+            for i1_h in T.Parallel(h_blk):
+                d_local[i1_h] = dq_shared[i1_h] * ds_shared[i1_h // blk]
+
+            for i_hco, i1_h in T.Parallel(hc, h_blk):
+                x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
+                for i_hci in T.vectorized(hc):
+                    x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
+
+            T.copy(x_local, x[i_n, 0, i0_h * h_blk])
+        if ENABLE_PDL:
+            T.pdl_trigger()
+
+
+@tilelang.jit(
+    pass_configs=pass_configs,
+)
 def mhc_post_tilelang(
     a,
     b,
@@ -702,6 +764,153 @@ def mhc_post_tilelang(
                     x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
 
             T.copy(x_local, x[i_n, 0, i0_h * h_blk])
+        if ENABLE_PDL:
+            T.pdl_trigger()
+
+
+@tilelang.jit(
+    pass_configs=pass_configs,
+)
+def mhc_post_sqrsum_int8_tilelang(
+    a,
+    b,
+    c,
+    d_q,
+    d_s,
+    x,
+    sqrsum,
+    hc: int,
+    hidden: int,
+    blk: int = 32,
+    n_thr: int = 128,
+    h_blk: int = 1024,
+) -> tilelang.JITKernel:
+    """Run int8 mHC post and produce the prenorm row sum-of-squares."""
+    n = T.dynamic("num_tokens")
+    h = hidden
+
+    h_blk = math.gcd(hidden, h_blk)
+    a: T.Tensor((n, hc, hc), T.float32)  # type: ignore[no-redef, valid-type]
+    b: T.Tensor((n, hc, h), T.bfloat16)  # type: ignore[no-redef, valid-type]
+    c: T.Tensor((n, hc), T.float32)  # type: ignore[no-redef, valid-type]
+    d_q: T.Tensor((n, h), T.int8)  # type: ignore[no-redef, valid-type]
+    d_s: T.Tensor((n, h // blk), T.bfloat16)  # type: ignore[no-redef, valid-type]
+    x: T.Tensor((n, hc, h), T.bfloat16)  # type: ignore[no-redef, valid-type]
+    sqrsum: T.Tensor((1, n), T.float32)  # type: ignore[no-redef, valid-type]
+    with T.Kernel(n, threads=n_thr) as i_n:
+        b_shared = T.alloc_shared((hc, h_blk), T.bfloat16)
+        dq_shared = T.alloc_shared(h_blk, T.int8)
+        ds_shared = T.alloc_shared(h_blk // blk, T.bfloat16)
+
+        x_local = T.alloc_fragment((hc, h_blk), T.float32)
+        b_local = T.alloc_fragment((hc, h_blk), T.float32)
+        d_local = T.alloc_fragment(h_blk, T.float32)
+        sq_acc = T.alloc_fragment((hc, h_blk), T.float32)
+
+        a_local = T.alloc_fragment((hc, hc), T.float32)
+        c_local = T.alloc_fragment(hc, T.float32)
+        if ENABLE_PDL:
+            T.pdl_sync()
+        T.copy(a[i_n, 0, 0], a_local)
+        T.copy(c[i_n, 0], c_local)
+        T.clear(sq_acc)
+
+        for i0_h in T.Serial(T.ceildiv(h, h_blk)):
+            T.copy(b[i_n, 0, i0_h * h_blk], b_shared)
+            T.copy(d_q[i_n, i0_h * h_blk], dq_shared)
+            T.copy(d_s[i_n, i0_h * h_blk // blk], ds_shared)
+
+            T.copy(b_shared, b_local)
+            for i1_h in T.Parallel(h_blk):
+                d_local[i1_h] = dq_shared[i1_h] * ds_shared[i1_h // blk]
+
+            for i_hco, i1_h in T.Parallel(hc, h_blk):
+                x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
+                for i_hci in T.vectorized(hc):
+                    x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
+
+            for i_hco, i1_h in T.Parallel(hc, h_blk):
+                xb = T.float32(T.bfloat16(x_local[i_hco, i1_h]))
+                sq_acc[i_hco, i1_h] += xb * xb
+
+            T.copy(x_local, x[i_n, 0, i0_h * h_blk])
+
+        sq_row = T.alloc_fragment(hc, T.float32)
+        sq_tot = T.alloc_fragment(1, T.float32)
+        T.reduce_sum(sq_acc, sq_row, dim=1)
+        T.reduce_sum(sq_row, sq_tot, dim=0)
+        if T.get_thread_binding() == 0:
+            sqrsum[0, i_n] = sq_tot[0]
+        if ENABLE_PDL:
+            T.pdl_trigger()
+
+
+@tilelang.jit(
+    pass_configs=pass_configs,
+)
+def mhc_post_sqrsum_tilelang(
+    a,
+    b,
+    c,
+    d,
+    x,
+    sqrsum,
+    hc: int,
+    hidden: int,
+    n_thr: int = 128,
+    h_blk: int = 1024,
+) -> tilelang.JITKernel:
+    """Run mHC post and produce the prenorm row sum-of-squares."""
+    n = T.dynamic("num_tokens")
+    h = hidden
+
+    h_blk = math.gcd(hidden, h_blk)
+    a: T.Tensor((n, hc, hc), T.float32)  # type: ignore[no-redef, valid-type]
+    b: T.Tensor((n, hc, h), T.bfloat16)  # type: ignore[no-redef, valid-type]
+    c: T.Tensor((n, hc), T.float32)  # type: ignore[no-redef, valid-type]
+    d: T.Tensor((n, h), T.bfloat16)  # type: ignore[no-redef, valid-type]
+    x: T.Tensor((n, hc, h), T.bfloat16)  # type: ignore[no-redef, valid-type]
+    sqrsum: T.Tensor((1, n), T.float32)  # type: ignore[no-redef, valid-type]
+    with T.Kernel(n, threads=n_thr) as i_n:
+        b_shared = T.alloc_shared((hc, h_blk), T.bfloat16)
+        d_shared = T.alloc_shared(h_blk, T.bfloat16)
+
+        x_local = T.alloc_fragment((hc, h_blk), T.float32)
+        b_local = T.alloc_fragment((hc, h_blk), T.float32)
+        d_local = T.alloc_fragment(h_blk, T.float32)
+        sq_acc = T.alloc_fragment((hc, h_blk), T.float32)
+
+        a_local = T.alloc_fragment((hc, hc), T.float32)
+        c_local = T.alloc_fragment(hc, T.float32)
+        if ENABLE_PDL:
+            T.pdl_sync()
+        T.copy(a[i_n, 0, 0], a_local)
+        T.copy(c[i_n, 0], c_local)
+        T.clear(sq_acc)
+
+        for i0_h in T.Serial(T.ceildiv(h, h_blk)):
+            T.copy(b[i_n, 0, i0_h * h_blk], b_shared)
+            T.copy(d[i_n, i0_h * h_blk], d_shared)
+
+            T.copy(b_shared, b_local)
+            T.copy(d_shared, d_local)
+            for i_hco, i1_h in T.Parallel(hc, h_blk):
+                x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
+                for i_hci in T.vectorized(hc):
+                    x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
+
+            for i_hco, i1_h in T.Parallel(hc, h_blk):
+                xb = T.float32(T.bfloat16(x_local[i_hco, i1_h]))
+                sq_acc[i_hco, i1_h] += xb * xb
+
+            T.copy(x_local, x[i_n, 0, i0_h * h_blk])
+
+        sq_row = T.alloc_fragment(hc, T.float32)
+        sq_tot = T.alloc_fragment(1, T.float32)
+        T.reduce_sum(sq_acc, sq_row, dim=1)
+        T.reduce_sum(sq_row, sq_tot, dim=0)
+        if T.get_thread_binding() == 0:
+            sqrsum[0, i_n] = sq_tot[0]
         if ENABLE_PDL:
             T.pdl_trigger()
 

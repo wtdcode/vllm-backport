@@ -975,6 +975,9 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
   custom_ar.def(
       "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "all_reduce_int8(int fa, Tensor inp, Tensor! out_q, Tensor! out_s, "
+      "int reg_buffer, int reg_buffer_sz_bytes) -> ()");
   custom_ar.def("dispose(int fa) -> ()");
   custom_ar.def("meta_size() -> int");
   custom_ar.def("register_buffer(int fa, int[] ipc_tensors) -> ()");
@@ -989,6 +992,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
 STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CUDA, custom_ar) {
   custom_ar.impl("init_custom_ar", TORCH_BOX(&init_custom_ar));
   custom_ar.impl("all_reduce", TORCH_BOX(&all_reduce));
+  custom_ar.impl("all_reduce_int8", TORCH_BOX(&all_reduce_int8));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CPU, custom_ar) {

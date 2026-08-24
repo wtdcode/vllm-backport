@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
+
 import torch
 
 import vllm.envs as envs
+from vllm.model_executor.kernels.mhc.ar_int8 import QUANT_BLOCK
 from vllm.utils.torch_utils import direct_register_custom_op
 
 # The prenorm GEMM is L2-bound on re-reads of `fn`, not CUDA-core bound: at
@@ -33,7 +36,21 @@ _PRENORM_USE_CUBLAS = True
 # at the HBM ceiling, so nothing is left to tune inside it). mhc_post holds
 # those values in registers one kernel earlier, so folding the reduction in
 # there removes the pass and a launch: measured 498.9 -> 350.6 us at T=8192.
-# Read per call rather than at import so a serving A/B only needs a restart.
+
+
+@functools.cache
+def _fuse_sqrsum_enabled() -> bool:
+    return envs.VLLM_MHC_POST_FUSE_SQRSUM
+
+
+def validate_mhc_optimization_flags() -> None:
+    if envs.VLLM_MHC_PRENORM_SHARD and not _fuse_sqrsum_enabled():
+        raise ValueError(
+            "VLLM_MHC_PRENORM_SHARD requires "
+            "VLLM_MHC_POST_FUSE_SQRSUM=1; without the fused row-sqrsum, "
+            "prenorm sharding is inactive"
+        )
+
 
 # (tile_n, split_k, n_thr) for the small-token fused post+prenorm kernel.
 # Swept over the full product at the shapes decode runs (m=5, 6, 12, 16;
@@ -489,12 +506,52 @@ def mhc_pre_broadcast_tilelang(
     )
 
 
+def mhc_post_int8_tilelang(
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    blk: int = QUANT_BLOCK,
+) -> torch.Tensor:
+    """Run mHC post while consuming a blockwise-int8 all-reduce output."""
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        mhc_post_int8_tilelang as _mhc_post_int8_kernel,
+    )
+
+    assert x_q.dtype == torch.int8, f"int8 mhc_post got {x_q.dtype}"
+    assert x_s.dtype == torch.bfloat16
+    hidden = residual.shape[-1]
+    assert x_s.shape[-1] == hidden // blk, (
+        f"expected {hidden // blk} scales per token, got {x_s.shape[-1]}"
+    )
+
+    out = torch.empty_like(residual)
+    _mhc_post_int8_kernel(
+        comb_res_mix,
+        residual,
+        post_layer_mix.squeeze(-1),
+        x_q,
+        x_s,
+        out,
+        residual.shape[-2],
+        hidden,
+        blk,
+    )
+    return out
+
+
 def mhc_post_tilelang(
     x: torch.Tensor,
     residual: torch.Tensor,
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
+    x_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if x_scales is not None:
+        return mhc_post_int8_tilelang(
+            x, x_scales, residual, post_layer_mix, comb_res_mix
+        )
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         mhc_post_tilelang as _mhc_post_kernel,
     )
@@ -529,6 +586,7 @@ def mhc_fused_post_pre_tilelang(
     tile_n: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    x_scales: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Run one MHC post block followed by the next MHC pre block.
@@ -544,17 +602,14 @@ def mhc_fused_post_pre_tilelang(
         layer_input_cur: shape (..., hidden_size)
     """
 
-    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
-        compute_num_split,
-        mhc_fused_tilelang,
-        mhc_post_tilelang,
-        mhc_pre_big_fuse_tilelang,
-        mhc_pre_big_fuse_with_norm_tilelang,
-    )
+    from vllm.model_executor.kernels.mhc import tilelang_kernels as _tk
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import compute_num_split
     from vllm.utils.math_utils import cdiv
 
     assert residual.dtype == torch.bfloat16
-    assert x.dtype == torch.bfloat16
+    assert x.dtype == (torch.int8 if x_scales is not None else torch.bfloat16), (
+        f"x is {x.dtype} but x_scales is {'set' if x_scales is not None else 'None'}"
+    )
     assert post_layer_mix.dtype == torch.float32
     assert comb_res_mix.dtype == torch.float32
     assert fn.dtype == torch.float32
@@ -598,6 +653,12 @@ def mhc_fused_post_pre_tilelang(
 
     use_deep_gemm = is_deep_gemm_supported()
     use_small_fma = num_tokens <= 16
+    use_int8_x = x_scales is not None
+    if use_int8_x:
+        assert not use_small_fma, (
+            "the int8 all-reduce is prefill-only; the small-FMA kernel has "
+            "no int8 variant"
+        )
     if use_small_fma:
         tile_n, n_splits, fma_n_thr = _SMALL_FMA_CONFIG
         if (
@@ -656,7 +717,7 @@ def mhc_fused_post_pre_tilelang(
     )
 
     if use_small_fma:
-        mhc_fused_tilelang(
+        _tk.mhc_fused_tilelang(
             comb_res_mix_flat,
             residual_flat,
             post_layer_mix_flat,
@@ -675,32 +736,29 @@ def mhc_fused_post_pre_tilelang(
         )
     else:
         residual_cur_2d = residual_cur.view(num_tokens, hc_mult * hidden_size)
-        fuse_sqrsum = envs.VLLM_MHC_POST_FUSE_SQRSUM and not use_deep_gemm
+        if use_int8_x:
+            assert x_scales is not None
+            assert x_scales.numel() * QUANT_BLOCK == x_flat.numel(), (
+                f"{x_scales.numel()} scales cannot cover {x_flat.numel()} "
+                f"int8 codes at block {QUANT_BLOCK}"
+            )
+        fuse_sqrsum = _fuse_sqrsum_enabled() and not use_deep_gemm
+        post_kernel = {
+            (False, False): _tk.mhc_post_tilelang,
+            (False, True): _tk.mhc_post_sqrsum_tilelang,
+            (True, False): _tk.mhc_post_int8_tilelang,
+            (True, True): _tk.mhc_post_sqrsum_int8_tilelang,
+        }[(use_int8_x, fuse_sqrsum)]
+        post_args = [comb_res_mix_flat, residual_flat, post_layer_mix_flat, x_flat]
+        if x_scales is not None:
+            post_args.append(x_scales.view(num_tokens, -1))
+        post_args.append(residual_cur)
         if fuse_sqrsum:
-            from vllm.model_executor.kernels.mhc.tilelang_kernels import (
-                mhc_post_sqrsum_tilelang,
-            )
-
-            mhc_post_sqrsum_tilelang(
-                comb_res_mix_flat,
-                residual_flat,
-                post_layer_mix_flat,
-                x_flat,
-                residual_cur,
-                gemm_out_sqrsum,
-                residual.shape[-2],
-                residual.shape[-1],
-            )
-        else:
-            mhc_post_tilelang(
-                comb_res_mix_flat,
-                residual_flat,
-                post_layer_mix_flat,
-                x_flat,
-                residual_cur,
-                residual.shape[-2],
-                residual.shape[-1],
-            )
+            post_args.append(gemm_out_sqrsum)
+        post_args += [residual.shape[-2], residual.shape[-1]]
+        if use_int8_x:
+            post_args.append(QUANT_BLOCK)
+        post_kernel(*post_args)
 
         if use_deep_gemm:
             from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
@@ -724,7 +782,7 @@ def mhc_fused_post_pre_tilelang(
             )
 
     if norm_weight is None:
-        mhc_pre_big_fuse_tilelang(
+        _tk.mhc_pre_big_fuse_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,
             hc_scale,
@@ -743,7 +801,7 @@ def mhc_fused_post_pre_tilelang(
             hc_mult,
         )
     else:
-        mhc_pre_big_fuse_with_norm_tilelang(
+        _tk.mhc_pre_big_fuse_with_norm_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,
             hc_scale,
@@ -789,6 +847,7 @@ def _mhc_fused_post_pre_tilelang_fake(
     tile_n: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    x_scales: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
@@ -824,6 +883,7 @@ def _mhc_post_tilelang_fake(
     residual: torch.Tensor,
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
+    x_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(residual)
 

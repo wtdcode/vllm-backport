@@ -67,6 +67,20 @@ def _worker() -> int:
     torch.manual_seed(1234)
     payload = (torch.randn(rows, HIDDEN, device="cuda") * (rank + 1)).to(DTYPE)
 
+    if os.environ.get("RUN_INT8") == "1":
+        from vllm.model_executor.kernels.mhc.ar_int8 import int8_all_reduce
+
+        ref = payload.float()
+        dist.all_reduce(ref)
+        out_q, out_s = int8_all_reduce(payload)
+        got = out_q.float() * out_s.float().repeat_interleave(32, dim=-1)
+        torch.accelerator.synchronize()
+        rel = (got - ref).abs().max().item() / ref.abs().max().item()
+        ok = rel < 5e-2
+        if rank == 0:
+            print(f"int8_ar rel_err={rel:.3e} -> {'PASS' if ok else 'FAIL'}")
+        return 0 if ok else 1
+
     ca = get_tp_group().device_communicator.ca_comm
     took_custom = ca is not None and ca.should_custom_ar(payload)
     if took_custom != expect_custom:
@@ -108,6 +122,30 @@ def test_large_payload_all_reduce(knob_mb: int | None):
         env.pop("VLLM_MAX_SIZE_MB_CUSTOM_ALL_REDUCE", None)
     else:
         env["VLLM_MAX_SIZE_MB_CUSTOM_ALL_REDUCE"] = str(knob_mb)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--nproc_per_node=8",
+            os.path.abspath(__file__),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=900,
+    )
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
+
+
+@pytest.mark.skipif(
+    current_platform.device_count() < 8,
+    reason="compressed prefill all-reduce needs the full 8-rank TP group",
+)
+def test_int8_payload_all_reduce():
+    env = dict(os.environ)
+    env["RUN_INT8"] = "1"
+    env["VLLM_MAX_SIZE_MB_CUSTOM_ALL_REDUCE"] = "32"
     result = subprocess.run(
         [
             sys.executable,

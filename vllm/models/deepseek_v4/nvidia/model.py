@@ -16,14 +16,22 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.model_executor.kernels.mhc.ar_int8 import (
+    ar_hoisted,
+    assert_hoist_preconditions,
+    int8_all_reduce,
+    use_int8_for,
+)
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_fused_post_pre_tilelang,
     mhc_post_tilelang,
     mhc_pre_broadcast_tilelang,
     mhc_pre_tilelang,
+    validate_mhc_optimization_flags,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
@@ -525,6 +533,10 @@ class DeepseekV4MoE(nn.Module):
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
+        if self.use_mega_moe and ar_hoisted(vllm_config):
+            raise ValueError(
+                "VLLM_MHC_AR_INT8 is not supported with deep_gemm_mega_moe"
+            )
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
@@ -670,6 +682,7 @@ class DeepseekV4MoE(nn.Module):
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.physical_expert_start = self.experts_start_idx
         self.physical_expert_end = self.experts_end_idx
+        hoisted = ar_hoisted(vllm_config)
 
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
@@ -689,7 +702,17 @@ class DeepseekV4MoE(nn.Module):
             router_logits_dtype=torch.float32,
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
+            reduce_results=not hoisted,
         )
+
+        if hoisted:
+            assert_hoist_preconditions(
+                vllm_config,
+                moe_config=self.experts.moe_config,
+                routed_output_transform=getattr(
+                    self.experts, "routed_output_transform", None
+                ),
+            )
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
@@ -821,7 +844,9 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         super().__init__()
 
+        validate_mhc_optimization_flags()
         config = vllm_config.model_config.hf_config
+        self._ar_hoisted = ar_hoisted(vllm_config)
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -886,6 +911,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             requires_grad=False,
         )
 
+    def _hoisted_all_reduce(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not self._ar_hoisted:
+            return x, None
+        if use_int8_for(x):
+            return int8_all_reduce(x)
+        return tensor_model_parallel_all_reduce(x), None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -894,7 +928,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        x_scales: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
         attn_norm_weight = self.attn_norm.weight.data
         attn_norm_eps = self.attn_norm.variance_epsilon
         if residual is None:
@@ -948,10 +989,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 tile_n=1,
                 norm_weight=attn_norm_weight,
                 norm_eps=attn_norm_eps,
+                x_scales=x_scales,
             )
 
         # attn_norm is fused into mhc_pre_tilelang / mhc_fused_post_pre above.
         x = self.attn(positions, x, None)
+        x, x_scales = self._hoisted_all_reduce(x)
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
@@ -972,10 +1015,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             tile_n=1,
             norm_weight=ffn_norm_weight,
             norm_eps=ffn_norm_eps,
+            x_scales=x_scales,
         )
 
         x = self.ffn(x, input_ids)
-        return x, residual, post_mix, res_mix
+        x, x_scales = self._hoisted_all_reduce(x)
+        return x, residual, post_mix, res_mix, x_scales
 
 
 def _drafter_needs_target_embed(vllm_config: VllmConfig) -> bool:
@@ -1052,8 +1097,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Costs one extra vocab-parallel table on the last stage only
         # (129280x4096 bf16 = 1.06 GB, ~265 MB/GPU at TP4).
         needs_embed = get_pp_group().is_first_rank or (
-            get_pp_group().is_last_rank
-            and _drafter_needs_target_embed(vllm_config)
+            get_pp_group().is_last_rank and _drafter_needs_target_embed(vllm_config)
         )
         if needs_embed:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1157,24 +1201,26 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
+        x_scales: torch.Tensor | None = None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            hidden_states, residual, post_mix, res_mix = layer(
+            hidden_states, residual, post_mix, res_mix, x_scales = layer(
                 hidden_states,
                 positions,
                 input_ids,
                 post_mix,
                 res_mix,
                 residual,
+                x_scales,
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
                 aux_recon = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
+                    hidden_states, residual, post_mix, res_mix, x_scales=x_scales
                 )
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
@@ -1184,7 +1230,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = final_aux_recon
             else:
                 hidden_states = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
+                    hidden_states, residual, post_mix, res_mix, x_scales=x_scales
                 )
 
         if not get_pp_group().is_last_rank:
