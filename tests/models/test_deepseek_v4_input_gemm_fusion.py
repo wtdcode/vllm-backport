@@ -261,3 +261,112 @@ def test_token_shard_still_declines_below_the_threshold():
 
     assert seen["wqa_wkv_rows"] == n_tokens
     assert qr_kv.shape[0] == n_tokens
+
+
+@pytest.mark.parametrize("use_int8", [False, True])
+def test_hoisted_all_reduce_readds_the_suppressed_collective(monkeypatch, use_int8):
+    import vllm.models.deepseek_v4.nvidia.model as model_mod
+
+    stub = nn.Module()
+    stub._ar_hoisted = True
+    x = torch.ones(32, HIDDEN, dtype=torch.bfloat16)
+    reduced = x + 1
+    codes = torch.ones_like(x, dtype=torch.int8)
+    scales = torch.ones(32, HIDDEN // 32, dtype=torch.bfloat16)
+    seen: list[str] = []
+
+    monkeypatch.setattr(model_mod, "use_int8_for", lambda _: use_int8)
+
+    def reduce_bf16(_):
+        seen.append("bf16")
+        return reduced
+
+    def reduce_int8(_):
+        seen.append("int8")
+        return codes, scales
+
+    monkeypatch.setattr(
+        model_mod,
+        "tensor_model_parallel_all_reduce",
+        reduce_bf16,
+    )
+    monkeypatch.setattr(
+        model_mod,
+        "int8_all_reduce",
+        reduce_int8,
+    )
+
+    actual, actual_scales = model_mod.DeepseekV4DecoderLayer._hoisted_all_reduce(
+        stub, x
+    )
+    if use_int8:
+        assert actual is codes
+        assert actual_scales is scales
+        assert seen == ["int8"]
+    else:
+        assert actual is reduced
+        assert actual_scales is None
+        assert seen == ["bf16"]
+
+
+def test_decoder_carries_int8_scales_to_each_mhc_post(monkeypatch):
+    import vllm.models.deepseek_v4.nvidia.model as model_mod
+
+    class Norm:
+        weight = torch.ones(HIDDEN, dtype=torch.bfloat16)
+        variance_epsilon = 1e-5
+
+    stub = nn.Module()
+    stub.attn_norm = Norm()
+    stub.ffn_norm = Norm()
+    stub.attn = lambda positions, x, _: x
+    stub.ffn = lambda x, input_ids: x
+    stub.hc_attn_fn = torch.empty(24, HIDDEN * 4)
+    stub.hc_ffn_fn = torch.empty(24, HIDDEN * 4)
+    stub.hc_attn_scale = torch.empty(3)
+    stub.hc_ffn_scale = torch.empty(3)
+    stub.hc_attn_base = torch.empty(24)
+    stub.hc_ffn_base = torch.empty(24)
+    stub.rms_norm_eps = 1e-6
+    stub.hc_eps = 1e-6
+    stub.hc_post_alpha = 2.0
+    stub.hc_sinkhorn_iters = 20
+
+    x = torch.ones(4, HIDDEN, dtype=torch.int8)
+    residual = torch.ones(4, 4, HIDDEN, dtype=torch.bfloat16)
+    post_mix = torch.ones(4, 4, 1)
+    res_mix = torch.ones(4, 4, 4)
+    incoming_scales = torch.ones(4, HIDDEN // 32, dtype=torch.bfloat16)
+    attn_scales = incoming_scales + 1
+    ffn_scales = incoming_scales + 2
+    reductions = iter(((x, attn_scales), (x, ffn_scales)))
+    stub._hoisted_all_reduce = lambda _: next(reductions)
+    seen_scales = []
+
+    def fused_post_pre(
+        x,
+        residual,
+        post_mix,
+        res_mix,
+        *args,
+        x_scales=None,
+        **kwargs,
+    ):
+        seen_scales.append(x_scales)
+        return residual, post_mix, res_mix, x.to(torch.bfloat16)
+
+    monkeypatch.setattr(model_mod, "mhc_fused_post_pre_tilelang", fused_post_pre)
+
+    *_, returned_scales = model_mod.DeepseekV4DecoderLayer.forward(
+        stub,
+        x,
+        torch.arange(4),
+        None,
+        post_mix,
+        res_mix,
+        residual,
+        incoming_scales,
+    )
+    assert seen_scales[0] is incoming_scales
+    assert seen_scales[1] is attn_scales
+    assert returned_scales is ffn_scales

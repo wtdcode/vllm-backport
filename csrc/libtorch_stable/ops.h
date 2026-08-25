@@ -459,6 +459,9 @@ fptr_t init_custom_ar(const std::vector<int64_t>& fake_ipc_ptrs,
 void all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
                 torch::stable::Tensor& out, fptr_t reg_buffer,
                 int64_t reg_buffer_sz_bytes);
+void all_reduce_int8(fptr_t _fa, torch::stable::Tensor& inp,
+                     torch::stable::Tensor& out_q, torch::stable::Tensor& out_s,
+                     fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
 void custom_all_gather(fptr_t _fa, torch::stable::Tensor& inp,
                        torch::stable::Tensor& out, fptr_t reg_buffer,
                        int64_t reg_buffer_sz_bytes);

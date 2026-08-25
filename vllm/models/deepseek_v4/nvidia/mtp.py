@@ -161,10 +161,16 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
             inputs_embeds
         ).unsqueeze(-2)
-        hidden_states, residual, post_mix, res_mix = self.mtp_block(
+        hidden_states, residual, post_mix, res_mix, x_scales = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        hidden_states = mhc_post_tilelang(
+            hidden_states,
+            residual,
+            post_mix,
+            res_mix,
+            x_scales=x_scales,
+        )
         # Return the flat pre-hc_head residual so it can be re-fed as the
         # next spec step's `previous_hidden_states` when
         # num_speculative_tokens > 1. hc_head is deferred to compute_logits.

@@ -84,8 +84,8 @@ export NCCL_PROTO=Simple
 Tips:
 
 - `FULL_AND_PIECEWISE` (v0.6.x default recommendation, previously `PIECEWISE`) captures the whole decode step — attention, MoE dispatch, NCCL all-reduce and the DSpark draft loop — into one CUDA graph. Measured on 4x/8x A6000: single-stream decode 45.6 -> 67-70 tok/s (+47%); prefill is unchanged (compute-bound). Two prerequisites:
-  - Pin NCCL with `NCCL_ALGO=Ring NCCL_PROTO=Simple` (and prefer `--disable-custom-all-reduce`). Graph replay must re-issue the exact captured collective; NCCL's size-adaptive algorithm switching is what made FULL capture "crash on Ampere" — Ampere itself is fine.
-  - Bound `cudagraph_capture_sizes` as shown. FULL graphs keep private memory pools; capturing every batch size up to `--max-num-seqs` can cost >800 MB per GPU and OOM warmup at high `--gpu-memory-utilization`.
+    - Pin NCCL with `NCCL_ALGO=Ring NCCL_PROTO=Simple` (and prefer `--disable-custom-all-reduce` unless enabling `VLLM_MHC_AR_INT8`, which requires custom all-reduce). Graph replay must re-issue the exact captured collective; NCCL's size-adaptive algorithm switching is what made FULL capture "crash on Ampere" — Ampere itself is fine.
+    - Bound `cudagraph_capture_sizes` as shown. FULL graphs keep private memory pools; capturing every batch size up to `--max-num-seqs` can cost >800 MB per GPU and OOM warmup at high `--gpu-memory-utilization`.
 - Adjust your TP (--tensor-parallel-size) and PP (--pipeline-parallel-size) accordingly.
 - head dtype override helps reduce garbage outputs.
 - DSpark is not working very well if you have PP>1.
@@ -111,8 +111,9 @@ All knobs this fork has added over stock vLLM. Defaults are what the images ship
 
 | Variable | Meaning |
 | --- | --- |
-| `VLLM_MHC_PRENORM_SHARD` | Shard the mHC prenorm GEMM across TP ranks (pays off at TP8, hurts at TP4). |
-| `VLLM_MHC_POST_FUSE_SQRSUM` | Fold the mHC prenorm row-sqrsum into `mhc_post`. |
+| `VLLM_MHC_PRENORM_SHARD` | Shard the mHC prenorm GEMM across TP ranks (pays off at TP8, hurts at TP4). Requires `VLLM_MHC_POST_FUSE_SQRSUM=1`; startup fails if the shard is requested without it. |
+| `VLLM_MHC_POST_FUSE_SQRSUM` | Fold the mHC prenorm row-sqrsum into `mhc_post`; required by `VLLM_MHC_PRENORM_SHARD`. |
+| `VLLM_MHC_AR_INT8` | Transport prefill attention and MoE all-reduces as blockwise int8 and consume them directly in `mhc_post`. Requires custom all-reduce and a sufficiently large `VLLM_MAX_SIZE_MB_CUSTOM_ALL_REDUCE`; changes numerics. |
 | `VLLM_UNREPLICATE_ATTN_GEMMS` | De-duplicate attention GEMMs that are replicated across TP ranks. |
 | `VLLM_INDEXER_QUERY_SHARD` / `VLLM_INDEXER_QUERY_SHARD_QPATH` | Shard the sparse-indexer query projection across TP ranks. |
 | `VLLM_SPARSE_RAGGED_FAST_SCAN` | Faster ragged-index scan in sparse prefill. |

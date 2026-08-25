@@ -364,6 +364,176 @@ def test_mhc_post_tilelang(num_tokens, hidden_size, hc_mult):
     torch.testing.assert_close(out, ref, atol=5e-2, rtol=1e-2)
 
 
+def test_prenorm_shard_requires_sqrsum_fold(monkeypatch):
+    from vllm.model_executor.kernels.mhc import tilelang as tilelang_mod
+
+    tilelang_mod._fuse_sqrsum_enabled.cache_clear()
+    monkeypatch.setattr(tilelang_mod.envs, "VLLM_MHC_PRENORM_SHARD", True)
+    monkeypatch.setattr(tilelang_mod.envs, "VLLM_MHC_POST_FUSE_SQRSUM", False)
+
+    with pytest.raises(ValueError, match="VLLM_MHC_POST_FUSE_SQRSUM=1"):
+        tilelang_mod.validate_mhc_optimization_flags()
+
+    tilelang_mod._fuse_sqrsum_enabled.cache_clear()
+
+
+@pytest.mark.parametrize("sqrsum_ready", [False, True])
+def test_prenorm_router_skips_a_completed_sqrsum(monkeypatch, sqrsum_ready):
+    import importlib
+
+    from vllm.model_executor.kernels.mhc import tilelang as tilelang_mod
+
+    triton_mod = importlib.import_module("vllm.model_executor.kernels.mhc.triton")
+    seen = []
+    monkeypatch.setattr(
+        triton_mod,
+        "hc_prenorm_gemm_cublas",
+        lambda x, fn, out, sqrsum: seen.append(sqrsum),
+    )
+    hidden, hc_mult, num_tokens = 4096, 4, 64
+    k = hidden * hc_mult
+    x = torch.zeros(num_tokens, k, dtype=torch.bfloat16)
+    fn = torch.zeros(24, k, dtype=torch.float32)
+    out = torch.zeros(1, num_tokens, 24, dtype=torch.float32)
+    sqrsum = torch.zeros(1, num_tokens, dtype=torch.float32)
+
+    tilelang_mod._tilelang_hc_prenorm_gemm(
+        x,
+        fn,
+        out,
+        sqrsum,
+        hidden,
+        hc_mult,
+        sqrsum_ready=sqrsum_ready,
+    )
+    assert len(seen) == 1
+    assert seen[0] is (None if sqrsum_ready else sqrsum)
+
+
+def test_int8_all_reduce_requires_custom_all_reduce(monkeypatch):
+    from types import SimpleNamespace
+
+    import vllm.distributed.parallel_state as parallel_state
+    from vllm.model_executor.kernels.mhc.ar_int8 import assert_hoist_preconditions
+
+    tp_group = SimpleNamespace(
+        device_communicator=SimpleNamespace(ca_comm=None),
+    )
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=64),
+    )
+
+    with pytest.raises(AssertionError, match="requires custom all-reduce"):
+        assert_hoist_preconditions(config)
+
+
+def test_mhc_custom_op_fake_signatures_match():
+    import inspect
+
+    from vllm.model_executor.kernels.mhc import tilelang as tilelang_mod
+
+    pairs = (
+        (
+            tilelang_mod.mhc_post_tilelang,
+            tilelang_mod._mhc_post_tilelang_fake,
+        ),
+        (
+            tilelang_mod.mhc_fused_post_pre_tilelang,
+            tilelang_mod._mhc_fused_post_pre_tilelang_fake,
+        ),
+    )
+    for implementation, fake in pairs:
+        assert inspect.signature(implementation) == inspect.signature(fake)
+
+
+@pytest.mark.skipif(
+    not HAS_TILELANG_MHC,
+    reason="TileLang MHC support required",
+)
+@pytest.mark.parametrize("num_tokens", [32, 2048])
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+def test_mhc_post_sqrsum_matches_standalone(num_tokens, hidden_size):
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        mhc_post_sqrsum_tilelang,
+    )
+
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+    hc_mult = 4
+    x = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16)
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    post_layer_mix = torch.randn((num_tokens, hc_mult), dtype=torch.float32)
+    comb_res_mix = torch.randn((num_tokens, hc_mult, hc_mult), dtype=torch.float32)
+
+    out = torch.empty_like(residual)
+    sqrsum = torch.empty((1, num_tokens), dtype=torch.float32)
+    mhc_post_sqrsum_tilelang(
+        comb_res_mix,
+        residual,
+        post_layer_mix,
+        x,
+        out,
+        sqrsum,
+        hc_mult,
+        hidden_size,
+    )
+
+    ref = mhc_post_ref(x, residual, post_layer_mix.unsqueeze(-1), comb_res_mix)
+    ref_sqrsum = out.float().square().sum(dim=(-2, -1)).unsqueeze(0)
+    torch.testing.assert_close(out, ref, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(sqrsum, ref_sqrsum, atol=0, rtol=1e-4)
+
+
+@pytest.mark.skipif(
+    not HAS_TILELANG_MHC,
+    reason="TileLang MHC support required",
+)
+@pytest.mark.parametrize("fuse_sqrsum", [False, True])
+def test_mhc_post_int8_matches_dequantized_reference(fuse_sqrsum):
+    from vllm.model_executor.kernels.mhc.ar_int8 import QUANT_BLOCK
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        mhc_post_int8_tilelang,
+        mhc_post_sqrsum_int8_tilelang,
+    )
+
+    torch.set_default_device(DEVICE)
+    set_random_seed(0)
+    num_tokens, hc_mult, hidden_size = 32, 4, 4096
+    x_q = torch.randint(-127, 128, (num_tokens, hidden_size), dtype=torch.int8)
+    x_s = torch.rand((num_tokens, hidden_size // QUANT_BLOCK), dtype=torch.bfloat16)
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    post_layer_mix = torch.randn((num_tokens, hc_mult), dtype=torch.float32)
+    comb_res_mix = torch.randn((num_tokens, hc_mult, hc_mult), dtype=torch.float32)
+
+    out = torch.empty_like(residual)
+    args = [
+        comb_res_mix,
+        residual,
+        post_layer_mix,
+        x_q,
+        x_s,
+        out,
+    ]
+    sqrsum = torch.empty((1, num_tokens), dtype=torch.float32)
+    if fuse_sqrsum:
+        args.append(sqrsum)
+        kernel = mhc_post_sqrsum_int8_tilelang
+    else:
+        kernel = mhc_post_int8_tilelang
+    kernel(*args, hc_mult, hidden_size, QUANT_BLOCK)
+
+    x_dequant = x_q.float() * x_s.float().repeat_interleave(QUANT_BLOCK, dim=-1)
+    ref = (
+        x_dequant.unsqueeze(-2) * post_layer_mix.unsqueeze(-1)
+        + torch.bmm(comb_res_mix.mT, residual.float())
+    ).bfloat16()
+    torch.testing.assert_close(out, ref, atol=5e-2, rtol=1e-2)
+    if fuse_sqrsum:
+        ref_sqrsum = out.float().square().sum(dim=(-2, -1)).unsqueeze(0)
+        torch.testing.assert_close(sqrsum, ref_sqrsum, atol=0, rtol=1e-4)
+
+
 @pytest.mark.skipif(
     not HAS_TILELANG_MHC,
     reason="TileLang MHC support required",

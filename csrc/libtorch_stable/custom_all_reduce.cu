@@ -115,6 +115,52 @@ void all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
   }
 }
 
+void all_reduce_int8(fptr_t _fa, torch::stable::Tensor& inp,
+                     torch::stable::Tensor& out_q, torch::stable::Tensor& out_s,
+                     fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      inp.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(inp.get_device_index());
+
+  STD_TORCH_CHECK(inp.scalar_type() == torch::headeronly::ScalarType::BFloat16,
+                  "int8 custom allreduce takes a bf16 input");
+  STD_TORCH_CHECK(out_q.scalar_type() == torch::headeronly::ScalarType::Char);
+  STD_TORCH_CHECK(out_s.scalar_type() ==
+                  torch::headeronly::ScalarType::BFloat16);
+  STD_TORCH_CHECK(_is_weak_contiguous(inp));
+  STD_TORCH_CHECK(_is_weak_contiguous(out_q));
+  STD_TORCH_CHECK(_is_weak_contiguous(out_s));
+  STD_TORCH_CHECK(inp.numel() % vllm::kQBlock == 0,
+                  "payload must be a multiple of the 32-element block");
+  STD_TORCH_CHECK(inp.numel() == out_q.numel());
+
+  int64_t nblk = inp.numel() / vllm::kQBlock;
+  STD_TORCH_CHECK(out_s.numel() == nblk, "one scale per block");
+  int64_t scale_off = ((inp.numel() + 15) / 16) * 16;
+  STD_TORCH_CHECK(scale_off + nblk * 2 <= reg_buffer_sz_bytes,
+                  "registered buffer too small for the int8+scale payload");
+
+  auto reg_buffer = reinterpret_cast<int8_t*>(_reg_buffer);
+  STD_TORCH_CHECK(reg_buffer != nullptr,
+                  "int8 custom allreduce requires a registered buffer");
+
+  int64_t threads = 256;
+  int64_t blocks = std::min<int64_t>(1024, (nblk + threads - 1) / threads);
+  vllm::quantize_blockwise_int8<<<blocks, threads, 0, stream>>>(
+      reinterpret_cast<const nv_bfloat16*>(inp.const_data_ptr()), reg_buffer,
+      nblk, scale_off);
+
+  int64_t part = nblk / fa->world_size_;
+  int64_t largest_part = part + nblk % fa->world_size_;
+  int64_t tmp_scale_off = ((largest_part * vllm::kQBlock + 15) / 16) * 16;
+
+  fa->allreduce_int8(stream, reg_buffer,
+                     reinterpret_cast<int8_t*>(out_q.mutable_data_ptr()),
+                     reinterpret_cast<nv_bfloat16*>(out_s.mutable_data_ptr()),
+                     nblk, scale_off, tmp_scale_off);
+}
+
 void dispose(fptr_t _fa) {
   delete reinterpret_cast<vllm::CustomAllreduce*>(_fa);
 }

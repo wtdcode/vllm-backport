@@ -177,13 +177,16 @@ class DSparkDeepseekV4Model(nn.Module):
 
         residual = post_mix = res_mix = None
         for layer in self.layers:
-            hidden_states, residual, post_mix, res_mix = layer(
+            hidden_states, residual, post_mix, res_mix, x_scales = layer(
                 hidden_states,
                 positions,
                 input_ids,
-                post_mix,
-                res_mix,
-                residual,
+                post_mix=post_mix,
+                res_mix=res_mix,
+                residual=residual,
+            )
+            assert x_scales is None, (
+                "DSpark drafter is decode-only; the int8 AR is prefill-only"
             )
         hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
         # hc_head reduces the hc copies; return the PRE-norm head hidden
