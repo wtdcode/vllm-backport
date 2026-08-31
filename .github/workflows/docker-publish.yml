@@ -120,7 +120,7 @@ jobs:
           [ "$JOBS" -lt 2 ] && JOBS=2
           echo "max_jobs=$JOBS" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         timeout-minutes: 2400
         with:
           context: .
