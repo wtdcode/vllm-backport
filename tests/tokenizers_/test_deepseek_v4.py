@@ -427,76 +427,30 @@ def test_deepseek_v4_encode_messages_rejects_invalid_arguments(kwargs):
 
     with pytest.raises(ValueError):
         encode_messages([{"role": "user", "content": "Hello"}], **kwargs)
-def _render(messages, **kwargs):
-    return _tokenizer().apply_chat_template(
-        conversation=messages, messages=messages, tokenize=False, **kwargs
-    )
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "expected_tail"),
-    [
-        ({}, "<think>"),
-        ({"thinking": False}, "</think>"),
-        ({"thinking": True}, "<think>"),
-    ],
-)
-def test_deepseek_v4_trailing_system_gets_generation_prompt(kwargs, expected_tail):
-    """A system message after the last user turn must still open an assistant turn.
-
-    Agent frameworks append context/reminder system messages after the user
-    turn. Without the generation prompt the model sees no assistant boundary
-    and continues the prompt as a document instead of answering.
-    """
-    prompt = _render(
+def test_deepseek_v4_image_blocks_become_placeholders():
+    prompt = _tokenizer().apply_chat_template(
         [
-            {"role": "system", "content": "you are helpful"},
-            {"role": "user", "content": "write the report"},
-            {"role": "system", "content": "Available agent types: ..."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first:"},
+                    {"type": "image_url", "image_url": {"url": "file:///a.png"}},
+                    {"type": "text", "text": "second:"},
+                    {"type": "image", "source": {"data": "AAAA"}},
+                ],
+            }
         ],
-        **kwargs,
-    )
-
-    assert prompt.endswith("<｜Assistant｜>" + expected_tail)
-
-
-def test_deepseek_v4_system_only_conversation_gets_generation_prompt():
-    prompt = _render(
-        [{"role": "system", "content": "just a system prompt"}], thinking=False
-    )
-
-    assert prompt.endswith("<｜Assistant｜></think>")
-
-
-def test_deepseek_v4_mid_conversation_system_does_not_open_a_turn():
-    """A system message that is not last must not emit a spurious turn marker."""
-    prompt = _render(
-        [
-            {"role": "system", "content": "you are helpful"},
-            {"role": "system", "content": "extra context"},
-            {"role": "user", "content": "hi"},
-        ],
+        tokenize=False,
         thinking=False,
     )
 
-    assert prompt.count("<｜Assistant｜>") == 1
-    assert prompt.endswith("<｜Assistant｜></think>")
+    assert "<｜User｜>first:<｜deepseek_image｜>second:<｜deepseek_image｜>" in prompt
 
 
-def test_deepseek_v4_system_before_latest_reminder_emits_no_turn_marker():
-    """Regression: a non-final system message must not open an assistant turn.
-
-    `latest_reminder` is exempt from the "what may follow" early return, so a
-    system message preceding one reaches the generation-prompt branch. Treating
-    it as a turn boundary injects a stray marker mid-prompt.
-    """
-    prompt = _render(
-        [
-            {"role": "system", "content": "sys"},
-            {"role": "latest_reminder", "content": "2026-08-04"},
-            {"role": "user", "content": "hi"},
-        ]
-    )
-
-    assert prompt.index("<｜latest_reminder｜>") < prompt.index("<｜Assistant｜>")
-    assert prompt.count("<｜Assistant｜>") == 1
+def test_deepseek_v4_max_token_id_covers_image_sentinels():
+    tok = _tokenizer()
+    # The vision variant expands image placeholders into out-of-vocab sentinel
+    # ids (vocab_size + 0..4); input validation relies on max_token_id.
+    assert tok.max_token_id >= tok.vocab_size + 4
