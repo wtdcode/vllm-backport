@@ -1388,7 +1388,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     dtype=dtype,
                     device=device,
                 ),
-          ,
                 "dsv4_img_ids": torch.zeros(
                     (batch_size,), dtype=torch.int64, device=device
                 ),
