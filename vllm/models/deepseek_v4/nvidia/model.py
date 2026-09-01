@@ -1057,6 +1057,11 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
+    if device_capability is not None and device_capability.major == 8:
+        from vllm.models.deepseek_v4.ampere.ampere_sparse import (
+            DeepseekV4AmpereMLAAttention,
+        )
+        return DeepseekV4AmpereMLAAttention
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
@@ -1383,6 +1388,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     dtype=dtype,
                     device=device,
                 ),
+          ,
+                "dsv4_img_ids": torch.zeros(
+                    (batch_size,), dtype=torch.int64, device=device
+                ),
             }
         )
 
@@ -1401,6 +1410,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+            if input_ids is None:
+                input_ids = intermediate_tensors["dsv4_img_ids"]
 
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
@@ -1450,7 +1461,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states})
+            return IntermediateTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "dsv4_img_ids": input_ids.to(torch.int64),
+                }
+            )
 
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
