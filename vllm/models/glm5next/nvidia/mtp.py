@@ -21,7 +21,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import get_pp_missing_layer_names, maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -307,6 +307,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        pp_missing_layer_names = get_pp_missing_layer_names(self)
         _pending_wk_fp8: dict = {}
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; the FP8-to-BF16 path pads them for the model.
@@ -333,6 +334,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 _pending_wk_fp8,
                 params_dict,
                 loaded_params,
+                pp_missing_layer_names,
             ):
                 continue
 
@@ -348,6 +350,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 params_dict,
                 loaded_params,
                 kv_a_pad_size,
+                pp_missing_layer_names,
             ):
                 continue
 
