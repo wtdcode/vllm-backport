@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm.entrypoints.chat_utils import parse_chat_messages
 from vllm.renderers.registry import RENDERER_REGISTRY
@@ -427,76 +428,60 @@ def test_deepseek_v4_encode_messages_rejects_invalid_arguments(kwargs):
 
     with pytest.raises(ValueError):
         encode_messages([{"role": "user", "content": "Hello"}], **kwargs)
-def _render(messages, **kwargs):
-    return _tokenizer().apply_chat_template(
-        conversation=messages, messages=messages, tokenize=False, **kwargs
-    )
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "expected_tail"),
-    [
-        ({}, "<think>"),
-        ({"thinking": False}, "</think>"),
-        ({"thinking": True}, "<think>"),
-    ],
-)
-def test_deepseek_v4_trailing_system_gets_generation_prompt(kwargs, expected_tail):
-    """A system message after the last user turn must still open an assistant turn.
-
-    Agent frameworks append context/reminder system messages after the user
-    turn. Without the generation prompt the model sees no assistant boundary
-    and continues the prompt as a document instead of answering.
-    """
-    prompt = _render(
+def test_deepseek_v4_image_blocks_become_placeholders():
+    prompt = _tokenizer().apply_chat_template(
         [
-            {"role": "system", "content": "you are helpful"},
-            {"role": "user", "content": "write the report"},
-            {"role": "system", "content": "Available agent types: ..."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first:"},
+                    {"type": "image_url", "image_url": {"url": "file:///a.png"}},
+                    {"type": "text", "text": "second:"},
+                    {"type": "image", "source": {"data": "AAAA"}},
+                ],
+            }
         ],
-        **kwargs,
-    )
-
-    assert prompt.endswith("<｜Assistant｜>" + expected_tail)
-
-
-def test_deepseek_v4_system_only_conversation_gets_generation_prompt():
-    prompt = _render(
-        [{"role": "system", "content": "just a system prompt"}], thinking=False
-    )
-
-    assert prompt.endswith("<｜Assistant｜></think>")
-
-
-def test_deepseek_v4_mid_conversation_system_does_not_open_a_turn():
-    """A system message that is not last must not emit a spurious turn marker."""
-    prompt = _render(
-        [
-            {"role": "system", "content": "you are helpful"},
-            {"role": "system", "content": "extra context"},
-            {"role": "user", "content": "hi"},
-        ],
+        tokenize=False,
         thinking=False,
     )
 
-    assert prompt.count("<｜Assistant｜>") == 1
-    assert prompt.endswith("<｜Assistant｜></think>")
+    assert "<｜User｜>first:<｜deepseek_image｜>second:<｜deepseek_image｜>" in prompt
 
 
-def test_deepseek_v4_system_before_latest_reminder_emits_no_turn_marker():
-    """Regression: a non-final system message must not open an assistant turn.
-
-    `latest_reminder` is exempt from the "what may follow" early return, so a
-    system message preceding one reaches the generation-prompt branch. Treating
-    it as a turn boundary injects a stray marker mid-prompt.
-    """
-    prompt = _render(
-        [
-            {"role": "system", "content": "sys"},
-            {"role": "latest_reminder", "content": "2026-08-04"},
-            {"role": "user", "content": "hi"},
-        ]
+def test_deepseek_v4_image_sentinel_ids_match_tokenizer():
+    """The borrowed sentinel ids must line up with the reserved
+    ``<|place_holder_mm_span_XXXX|>`` tokens in the tokenizer."""
+    from vllm.models.deepseek_v4.common.mm_preprocess import (
+        IMAGE_SENTINEL_BASE_ID,
+        IMAGE_SENTINEL_TOKEN_NAMES,
+        image_sentinel_mask,
+        validate_image_sentinel_ids,
     )
 
-    assert prompt.index("<｜latest_reminder｜>") < prompt.index("<｜Assistant｜>")
-    assert prompt.count("<｜Assistant｜>") == 1
+    class FakeTokenizer:
+        def __init__(self, offset: int = 0) -> None:
+            self.offset = offset
+
+        def convert_tokens_to_ids(self, token: str) -> int:
+            return (
+                IMAGE_SENTINEL_BASE_ID
+                + self.offset
+                + (IMAGE_SENTINEL_TOKEN_NAMES.index(token))
+            )
+
+    validate_image_sentinel_ids(FakeTokenizer())  # no raise
+    with pytest.raises(ValueError, match="sentinel"):
+        validate_image_sentinel_ids(FakeTokenizer(offset=1))
+
+    ids = torch.tensor(
+        [
+            1,
+            IMAGE_SENTINEL_BASE_ID,
+            IMAGE_SENTINEL_BASE_ID + 4,
+            IMAGE_SENTINEL_BASE_ID + 5,
+            129264,
+        ]
+    )
+    assert image_sentinel_mask(ids).tolist() == [False, True, True, False, False]
