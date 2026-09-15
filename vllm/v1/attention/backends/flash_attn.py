@@ -10,6 +10,7 @@ from typing import ClassVar
 import numpy as np
 import torch
 
+
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
@@ -279,6 +280,12 @@ class FlashAttentionMetadata:
     num_prefill_reqs: int = 0
     num_decode_tokens: int = 0
     num_prefill_tokens: int = 0
+
+    # True request count for this step. cu_seqlens_q/seqused_k are padded persistent
+    # buffers whose tails keep the previous (larger) batch's values, so a consumer that
+    # derives the count from query_start_loc.shape[0] - 1 can address slots that do not
+    # exist this step. The split-KV verify attention needs the exact count.
+    num_reqs: int = 0
 
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
@@ -730,6 +737,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             slot_mapping=slot_mapping,
             max_dcp_context_kv_len=max_dcp_context_kv_len,
             dcp_context_kv_lens=dcp_context_kv_lens,
+            num_reqs=num_reqs,
             num_decode_reqs=num_decode_reqs,
             num_prefill_reqs=num_prefill_reqs,
             num_decode_tokens=num_decode_tokens,
@@ -870,6 +878,19 @@ class FlashAttentionImpl(AttentionImpl):
 
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
+        # Split-KV spec-decode attention (v1/attention/ops/spec_decode_attn.py): the
+        # partial buffers are sized once, for the largest batch the scheduler can hand
+        # us and for the longest verify block. forward() runs outside any vLLM config
+        # context, so read both here.
+        _cfg = get_current_vllm_config_or_none()
+        _spec_cfg = _cfg.speculative_config if _cfg is not None else None
+        self.spec_attn_max_reqs = (
+            _cfg.scheduler_config.max_num_seqs if _cfg is not None else 0
+        )
+        self.spec_attn_qmax = 1 + (
+            int(_spec_cfg.num_speculative_tokens) if _spec_cfg is not None else 0
+        )
+
         self.attn_type = attn_type
         vllm_config = get_current_vllm_config_or_none()
         uses_kv_cache = attn_type not in (
@@ -997,6 +1018,12 @@ class FlashAttentionImpl(AttentionImpl):
         # performance to make sure it does not introduce any overhead.
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+        # Diagnostic: flag negative metadata entries (slot_mapping / block_table)
+        # at the attention entry; the last marker before a crash brackets the
+        # faulting call.
+        # Upper bound too: a block id beyond the pool is just as wild as a negative one,
+        # and the consumers only exclude the null id.
+        # Host-side facts, written directly into host-mapped memory (eager path).
 
         # Handle encoder attention differently - no KV cache needed
         if attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
@@ -1012,6 +1039,10 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
+        import os as _os
+
+        _sync_bisect = _os.environ.get("VLLM_FA2_SYNC_BISECT", "0") == "1"
+
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         # Fix degenerate strides on size-1 dims (e.g. num_kv_heads=1 with TP).
         # FA3/4 on H100+ uses TMA, which requires ≥16-byte stride alignment.
@@ -1036,6 +1067,7 @@ class FlashAttentionImpl(AttentionImpl):
             key_cache = key_cache.view(current_platform.fp8_dtype())
             value_cache = value_cache.view(current_platform.fp8_dtype())
 
+        # Live (replay-time) metadata: scalar args are frozen at capture, tensors are not.
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
@@ -1160,6 +1192,43 @@ class FlashAttentionImpl(AttentionImpl):
                     block_table = block_table[:, :num_pages]
                     num_splits = 1
 
+                # Split-KV Triton attention for speculative-decode verify batches.
+                # FA2 cannot split the KV sequence when max_seqlen_q > 1
+                # ("FA2 does not support num_splits > 1"), which leaves the whole KV
+                # sequence read by num_kv_heads thread blocks; the standalone kernel
+                # below tiles the query and the KV so the grid fills the device.
+                if (
+                    _spec_attn_enabled()
+                    and 1 < max_seqlen_q <= _spec_attn_qmax(self)
+                    # fp8/int8 KV is supported: the kernel dequantizes on load with the
+                    # layer's scales (added 2026-09-13).
+                    and (
+                        sliding_window_size is None
+                        or (sliding_window_size[0] < 0 and sliding_window_size[1] < 0)
+                    )
+                    and not self.logits_soft_cap
+                    and self.alibi_slopes is None
+                    and self.sinks is None
+                    and causal is True
+                    and mm_mask_mod is None
+                    and rswa_mask_mod_fn is None
+                ):
+                    if _spec_attn_run(
+                        self,
+                        query[:num_actual_tokens],
+                        key_cache,
+                        value_cache,
+                        output[:num_actual_tokens],
+                        cu_seqlens_q,
+                        seqused_k,
+                        block_table,
+                        attn_metadata.num_reqs or (cu_seqlens_q.shape[0] - 1),
+                        max_seqlen_q,
+                        k_scale=layer._k_scale_float,
+                        v_scale=layer._v_scale_float,
+                    ):
+                        return output
+
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
@@ -1242,6 +1311,8 @@ class FlashAttentionImpl(AttentionImpl):
         # and value[:num_actual_tokens] because the reshape_and_cache_flash
         # op uses the slot_mapping's shape to determine the number of
         # actual tokens.
+        import os as _os
+
         reshape_and_cache_flash(
             key,
             value,
@@ -1833,3 +1904,66 @@ def cascade_attention(
 
     # Merge prefix and suffix outputs, and store the result in output.
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
+
+
+# ---- Split-KV spec-decode attention (ported from syv-ai/qwen38-27b-rtx3090) ----
+# See vllm/v1/attention/ops/spec_decode_attn.py. Enabled with VLLM_SPEC_DECODE_ATTN=1.
+_SPEC_ATTN: dict = {}
+
+
+def _spec_attn_enabled() -> bool:
+    import os
+
+    return os.environ.get("VLLM_SPEC_DECODE_ATTN", "0") == "1"
+
+
+_SPEC_ATTN_QMAX: int | None = None
+
+
+def _spec_attn_qmax(impl) -> int:
+    """Query tokens per request this kernel will accept, fixed for the server's life:
+    the partial buffers are sized once for it and a captured CUDA graph holds their
+    addresses."""
+    global _SPEC_ATTN_QMAX
+    if _SPEC_ATTN_QMAX is None:
+        import os
+
+        from vllm.v1.attention.ops.spec_decode_attn import BLOCK_M, QMAX_TOKENS
+
+        n = int(os.environ.get("VLLM_SPEC_DECODE_ATTN_QMAX", 0)) or impl.spec_attn_qmax
+        _SPEC_ATTN_QMAX = min(
+            QMAX_TOKENS, max(n, BLOCK_M // impl.num_queries_per_kv)
+        )
+        # qmax > the actual verify block is harmless (more partial rows than used),
+        # but a smaller qmax silently falls back to FA2.
+        if n > _SPEC_ATTN_QMAX:
+            from vllm.logger import init_logger
+
+            init_logger(__name__).warning(
+                "split-KV spec-decode attention: verify block %d exceeds the kernel "
+                "limit %d; falling back to FA2", n, _SPEC_ATTN_QMAX
+            )
+    return _SPEC_ATTN_QMAX
+
+
+def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k,
+                   block_table, num_reqs, max_query_len, k_scale=1.0, v_scale=1.0):
+    """Returns True when the kernel ran, False when the batch must fall back to FA2."""
+    from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
+
+    key = (impl.num_heads, impl.head_size, q.device)
+    att = _SPEC_ATTN.get(key)
+    if att is None:
+        att = SpecDecodeAttention(
+            impl.spec_attn_max_reqs,
+            impl.num_heads,
+            impl.head_size,
+            q.device,
+            _spec_attn_qmax(impl),
+        )
+        _SPEC_ATTN[key] = att
+    att.run(
+        q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table,
+        impl.scale, num_reqs, max_query_len, k_scale, v_scale,
+    )
+    return True
