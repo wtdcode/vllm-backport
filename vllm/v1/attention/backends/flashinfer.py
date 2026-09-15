@@ -672,6 +672,11 @@ class FlashInferMetadata:
     """
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
+    # Real (unpadded) prefill token count, derived from the prefill qo_indptr. The
+    # runner pads num_actual_tokens for CUDA-graph capture, so num_prefill_tokens can
+    # exceed what the paged-prefill plan covers; slicing the query by this keeps the
+    # query and qo_indptr consistent (padded rows carry -1 slots and are dropped).
+    prefill_real_tokens: int = 0
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -1317,6 +1322,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         block_table_tensor = common_attn_metadata.block_table_tensor
         qo_indptr = common_attn_metadata.query_start_loc
         qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu
+        # Real (unpadded) token count: query_start_loc's last entry. The runner pads
+        # num_actual_tokens for CUDA-graph capture, so the query tensor can be longer
+        # than what the paged plans cover; FlashInfer validates the two against each
+        # other, so slice the query by this.
+        real_total_tokens = int(qo_indptr_cpu[num_reqs])
 
         # Step 1: Decide which dispatch modes to use:
         # - Cascade attention (distinct mode)
@@ -1394,6 +1404,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
+            prefill_real_tokens=real_total_tokens,
             causal=causal,
             use_cascade=use_cascade,
             prefill=None,
@@ -1535,6 +1546,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 qo_indptr_cpu[prefill_start:] - qo_indptr_cpu[prefill_start]
             )
             assert qo_indptr_prefill_cpu.shape[0] == num_prefills + 1
+            num_prefill_real_tokens = int(qo_indptr_prefill_cpu[-1])
 
             if prefill_use_trtllm:
                 # TRTLLM prefill has no cross-rank combine for DCP-sharded KV;
@@ -2143,8 +2155,17 @@ class FlashInferImpl(AttentionImpl):
         # Regular attention (common case).
         # Decodes are at the front and prefills are at the back.
         if num_prefill_tokens > 0:
-            prefill_query = query[num_decode_tokens:]
-            assert prefill_query.shape[0] == num_prefill_tokens
+            # Slice by the real count: num_prefill_tokens may include CUDA-graph
+            # padding, which the paged-prefill plan (built from qo_indptr) does not
+            # cover. Keeping the query and the indptr on the same token count is what
+            # FlashInfer validates.
+            real_prefill = max(
+                0, attn_metadata.prefill_real_tokens - num_decode_tokens
+            )
+            if real_prefill == 0:
+                real_prefill = num_prefill_tokens
+            prefill_query = query[num_decode_tokens : num_decode_tokens + real_prefill]
+            assert prefill_query.shape[0] == real_prefill <= num_prefill_tokens
 
             # Convert query to the expected dtype for prefill if needed.
             prefill_query = self.maybe_quant_query(
@@ -2206,9 +2227,11 @@ class FlashInferImpl(AttentionImpl):
                         self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
                     )
                     if needs_fp8_out_prefill:
-                        out_prefill = self._nvfp4_fp8_out[:num_prefill_tokens]
+                        out_prefill = self._nvfp4_fp8_out[:real_prefill]
                     else:
-                        out_prefill = output[num_decode_tokens:]
+                        out_prefill = output[
+                            num_decode_tokens : num_decode_tokens + real_prefill
+                        ]
 
                     if isinstance(
                         prefill_wrapper, BatchAttentionWithAttentionSinkWrapper
@@ -2235,7 +2258,7 @@ class FlashInferImpl(AttentionImpl):
 
                     if needs_fp8_out_prefill:
                         output[
-                            num_decode_tokens : num_decode_tokens + num_prefill_tokens
+                            num_decode_tokens : num_decode_tokens + real_prefill
                         ].copy_(out_prefill)
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
@@ -2272,7 +2295,7 @@ class FlashInferImpl(AttentionImpl):
                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
                 needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
                 if needs_fp8_out:
-                    out = self._nvfp4_fp8_out[:num_prefill_tokens]
+                    out = self._nvfp4_fp8_out[:real_prefill]
 
                 prefill_kv_block_scales = None
                 if self.is_kvcache_nvfp4:
@@ -2343,8 +2366,8 @@ class FlashInferImpl(AttentionImpl):
 
                 if needs_fp8_out:
                     output[
-                        num_decode_tokens : num_decode_tokens + num_prefill_tokens
-                    ].copy_(out[:num_prefill_tokens])
+                        num_decode_tokens : num_decode_tokens + real_prefill
+                    ].copy_(out[:real_prefill])
 
         if num_decode_tokens > 0:
             decode_query = query[:num_decode_tokens]
