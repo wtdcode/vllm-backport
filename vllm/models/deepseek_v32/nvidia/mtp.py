@@ -366,6 +366,18 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            # The checkpoint stores embed_tokens once, as a top-level weight
+            # with no spec layer index. Without PP the draft shares the
+            # target's embedding afterwards, but under pipeline parallelism the
+            # target's embed_tokens is a PPMissingLayer on the draft's (last)
+            # stage, so the draft must load its own copy here or it drafts
+            # from uninitialized weights (position-0 acceptance ~0.2).
+            if name == "model.embed_tokens.weight" and name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue

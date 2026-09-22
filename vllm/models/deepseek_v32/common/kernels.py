@@ -7,6 +7,11 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.v1.attention.ops.fp8_sm80 import _encode_e4m3fn_u8
+
+# Triton refuses fp8e4nv converts and fp8 pointer arguments below SM89, so
+# every fp8 output here is written as e4m3 bytes through a uint8 pointer
+# (hardware convert on SM89+, software RNE encoder on SM80/86).
 
 # Cache of tiny 1-element dummy tensors (per device, dtype) reused by the
 # has_indexer=False path so the indexer args don't allocate every call.
@@ -50,13 +55,14 @@ def _get_cos_sin(
 def _fp8_ue8m0_quantize(vals):
     """Quantize float32 values to FP8 E4M3 with a ue8m0 (power-of-2) scale.
 
-    Returns (fp8_vals, scale) so the caller can store them or reuse the scale.
+    Returns (fp8_bytes, scale): the e4m3 values as uint8 so the caller can
+    store them through a uint8 pointer, and the scale for reuse.
     """
     vals = vals.to(tl.float32)
     amax = tl.max(tl.abs(vals))
     scale = tl.div_rn(tl.maximum(amax, 1e-4), 448.0)
     scale = tl.math.exp2(tl.math.ceil(tl.math.log2(scale)))
-    fp8_vals = tl.div_rn(vals, scale).to(tl.float8e4nv)
+    fp8_vals = _encode_e4m3fn_u8(tl.div_rn(vals, scale))
     return fp8_vals, scale
 
 
@@ -131,7 +137,7 @@ def _fused_norm_rope_kernel(
     INDEX_K_HALF_ROT_DIM: tl.constexpr,
     # Cache params (shared by indexer K and MLA)
     slot_mapping_ptr,
-    # Index K FP8 cache
+    # Index K FP8 cache (uint8 view of the e4m3 bytes)
     indexer_cache_ptr,
     indexer_cache_scale_ptr,
     indexer_cache_block_size,
@@ -144,8 +150,8 @@ def _fused_norm_rope_kernel(
     MLA_CACHE_FP8: tl.constexpr,
     mla_cache_scale_ptr,
     # fp8_ds_mla cache views (block-scaled fp8 NoPE + unquantized bf16 RoPE).
-    # mla_cache_ptr is the fp8 (1-byte) view, so the block/entry strides above
-    # are byte offsets; these two share the same buffer as fp32 / bf16 views.
+    # mla_cache_ptr is the uint8 view, so the block/entry strides above are
+    # byte offsets; these two share the same buffer as fp32 / bf16 views.
     mla_cache_ds_scale_ptr,
     mla_cache_ds_rope_ptr,
     MLA_CACHE_DS_MLA: tl.constexpr,
@@ -268,7 +274,7 @@ def _fused_norm_rope_kernel(
                 #   bytes [KV_DIM, KV_DIM + 16)  : MLA_NUM_TILES float32 scales
                 #   bytes [KV_DIM + 16, ...)     : 2 * KPE_HALF_ROT_DIM bf16 RoPE
                 # mla_cache_block_stride / mla_cache_entry_stride are byte strides
-                # (mla_cache_ptr is the 1-byte fp8 view of the uint8 cache).
+                # (mla_cache_ptr is the uint8 view of the cache).
                 byte_base = (
                     mla_block_idx * mla_cache_block_stride
                     + mla_block_off * mla_cache_entry_stride
@@ -278,7 +284,7 @@ def _fused_norm_rope_kernel(
                 # scale = amax / 448 (fp8 e4m3 max), matching the reference
                 # concat_and_cache_ds_mla kernel; floored to FLT_MIN.
                 tile_scale = tl.maximum(tile_amax * (1.0 / 448.0), 1.1754944e-38)
-                kv_c_fp8 = tl.reshape((kv_2d / tile_scale).to(tl.float8e4nv), (KV_DIM,))
+                kv_c_fp8 = tl.reshape(_encode_e4m3fn_u8(kv_2d / tile_scale), (KV_DIM,))
                 tl.store(mla_cache_ptr + byte_base + kv_block, kv_c_fp8)
                 tile_off = tl.arange(0, MLA_NUM_TILES)
                 tl.store(
@@ -298,16 +304,16 @@ def _fused_norm_rope_kernel(
             # kv_c_normed (KV_DIM elements)
             if MLA_CACHE_FP8:
                 scale = tl.load(mla_cache_scale_ptr)
-                kv_c_fp8 = (kv_c.to(tl.float32) / scale).to(tl.float8e4nv)
+                kv_c_fp8 = _encode_e4m3fn_u8(kv_c.to(tl.float32) / scale)
                 tl.store(dst + kv_block, kv_c_fp8)
             else:
                 tl.store(dst + kv_block, kv_c)
             # k_pe_roped (from registers, interleaved layout)
             if MLA_CACHE_FP8:
-                tl.store(dst + KV_DIM + dim_off * 2, (r1 / scale).to(tl.float8e4nv))
+                tl.store(dst + KV_DIM + dim_off * 2, _encode_e4m3fn_u8(r1 / scale))
                 tl.store(
                     dst + KV_DIM + dim_off * 2 + 1,
-                    (r2 / scale).to(tl.float8e4nv),
+                    _encode_e4m3fn_u8(r2 / scale),
                 )
             else:
                 tl.store(dst + KV_DIM + dim_off * 2, r1)
@@ -479,8 +485,7 @@ def fused_norm_rope(
         idx_cache_scale_view = indexer_k_cache.view(torch.uint8).view(torch.float32)
         idx_cache_block_size = indexer_k_cache.shape[1]
         idx_cache_stride = indexer_k_cache.shape[2]
-        if indexer_k_cache.dtype == torch.uint8:
-            indexer_k_cache = indexer_k_cache.view(torch.float8_e4m3fn)
+        indexer_k_cache = indexer_k_cache.view(torch.uint8)
     else:
         idx_cache_scale_view = None
         idx_cache_block_size = 1
@@ -496,7 +501,7 @@ def fused_norm_rope(
         mla_block_size = mla_kv_cache.shape[1]
         if mla_cache_ds_mla:
             # 656-byte custom layout addressed in bytes; mla_cache_ptr is the
-            # 1-byte fp8 view, so block/entry strides are byte offsets and the
+            # uint8 view, so block/entry strides are byte offsets and the
             # fp32/bf16 views share the same buffer.
             assert kv_dim == 512, "fp8_ds_mla requires kv_lora_rank == 512"
             mla_num_tiles = kv_dim // 128
@@ -505,12 +510,12 @@ def fused_norm_rope(
             mla_entry_stride = u8_cache.stride(1)
             mla_ds_scale_view = u8_cache.view(torch.float32)
             mla_ds_rope_view = u8_cache.view(torch.bfloat16)
-            mla_kv_cache = u8_cache.view(torch.float8_e4m3fn)
+            mla_kv_cache = u8_cache
         else:
             mla_block_stride = mla_kv_cache.stride(0)
             mla_entry_stride = mla_kv_cache.stride(1)
-            if mla_cache_fp8 and mla_kv_cache.dtype == torch.uint8:
-                mla_kv_cache = mla_kv_cache.view(torch.float8_e4m3fn)
+            if mla_cache_fp8:
+                mla_kv_cache = mla_kv_cache.view(torch.uint8)
         if mla_k_scale is None:
             mla_k_scale = torch.ones(1, dtype=torch.float32, device=device)
     else:
@@ -626,12 +631,13 @@ def _fused_q_kernel(
     index_q_cos_sin_ptr,
     index_q_cos_sin_stride,
     INDEX_Q_HALF_ROT_DIM: tl.constexpr,
-    # Index Q Quantize
+    # Index Q Quantize (uint8 view of the e4m3 output)
     index_q_fp8_ptr,
     index_q_fp8_stride0,
     index_q_fp8_stride1,
     INDEX_Q_HEAD_DIM: tl.constexpr,
     # MQA query pack: quantize ql_nope and RoPE+quantize q_pe into mqa_q_fp8
+    # (uint8 view when QUANTIZE_MQA, otherwise the bf16 q_pe_out placeholder)
     ql_nope_ptr,
     ql_nope_stride0,
     ql_nope_stride1,
@@ -668,33 +674,35 @@ def _fused_q_kernel(
     if pid == 2:
         # ql_nope quantize + pack into the front of mqa_q_fp8. On the bf16
         # query path ql_nope is consumed as-is (no pack), so skip entirely.
-        if not QUANTIZE_MQA:
-            return
-        if 2 * head_idx >= NUM_Q_HEADS:
-            return
+        # Kept as a constexpr branch rather than an early return: Triton still
+        # compiles the code after a static return, and the fp8 pack must not
+        # be emitted against the bf16 placeholder pointer.
+        if QUANTIZE_MQA:
+            if 2 * head_idx >= NUM_Q_HEADS:
+                return
 
-        scale = tl.load(q_scale_ptr)
-        for local_head in range(2):
-            q_head_idx = head_idx * 2 + local_head
-            if q_head_idx < NUM_Q_HEADS:
-                ql_nope_off = tl.arange(0, QL_NOPE_BLOCK)
-                ql_nope_mask = ql_nope_off < QL_NOPE_DIM
-                ql_nope = tl.load(
-                    ql_nope_ptr
-                    + tok_idx * ql_nope_stride0
-                    + q_head_idx * ql_nope_stride1
-                    + ql_nope_off,
-                    mask=ql_nope_mask,
-                ).to(tl.float32)
-                ql_nope_fp8 = (ql_nope / scale).to(tl.float8e4nv)
-                tl.store(
-                    mqa_q_fp8_ptr
-                    + tok_idx * mqa_q_fp8_stride0
-                    + q_head_idx * mqa_q_fp8_stride1
-                    + ql_nope_off,
-                    ql_nope_fp8,
-                    mask=ql_nope_mask,
-                )
+            scale = tl.load(q_scale_ptr)
+            for local_head in range(2):
+                q_head_idx = head_idx * 2 + local_head
+                if q_head_idx < NUM_Q_HEADS:
+                    ql_nope_off = tl.arange(0, QL_NOPE_BLOCK)
+                    ql_nope_mask = ql_nope_off < QL_NOPE_DIM
+                    ql_nope = tl.load(
+                        ql_nope_ptr
+                        + tok_idx * ql_nope_stride0
+                        + q_head_idx * ql_nope_stride1
+                        + ql_nope_off,
+                        mask=ql_nope_mask,
+                    ).to(tl.float32)
+                    ql_nope_fp8 = _encode_e4m3fn_u8(ql_nope / scale)
+                    tl.store(
+                        mqa_q_fp8_ptr
+                        + tok_idx * mqa_q_fp8_stride0
+                        + q_head_idx * mqa_q_fp8_stride1
+                        + ql_nope_off,
+                        ql_nope_fp8,
+                        mask=ql_nope_mask,
+                    )
         return
     elif pid == 0:
         # q_pe RoPE + quantize + pack into the tail of mqa_q_fp8.
@@ -736,7 +744,7 @@ def _fused_q_kernel(
                         + q_head_idx * mqa_q_fp8_stride1
                         + QL_NOPE_DIM
                         + rot_off * 2,
-                        (r1 / scale).to(tl.float8e4nv),
+                        _encode_e4m3fn_u8(r1 / scale),
                     )
                     tl.store(
                         mqa_q_fp8_ptr
@@ -745,7 +753,7 @@ def _fused_q_kernel(
                         + QL_NOPE_DIM
                         + rot_off * 2
                         + 1,
-                        (r2 / scale).to(tl.float8e4nv),
+                        _encode_e4m3fn_u8(r2 / scale),
                     )
                 else:
                     # bf16 query: write the RoPE'd q_pe unquantized.
@@ -900,13 +908,14 @@ def fused_q(
             dtype=torch.float8_e4m3fn,
             device=q_pe.device,
         )
-        # Placeholder; pid 0 packs q_pe into mqa_q_fp8 instead.
-        q_pe_out = mqa_q_fp8
         mqa_q = mqa_q_fp8
+        mqa_q_fp8_u8 = mqa_q_fp8.view(torch.uint8)
+        # Placeholder; pid 0 packs q_pe into mqa_q_fp8 instead.
+        q_pe_out = mqa_q_fp8_u8
     else:
         # bf16 path: only the RoPE'd q_pe is produced; ql_nope used directly.
         q_pe_out = torch.empty_like(q_pe)
-        mqa_q_fp8 = q_pe_out  # unused placeholder for the fp8 pack pointer
+        mqa_q_fp8_u8 = q_pe_out  # unused placeholder for the fp8 pack pointer
         mqa_q = q_pe_out
 
     index_q_fp8 = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
@@ -948,16 +957,16 @@ def fused_q(
         index_q_cos_sin_cache,
         index_q_cos_sin_cache.stride(0),
         index_q_cos_sin_cache.shape[-1] // 2,
-        index_q_fp8,
+        index_q_fp8.view(torch.uint8),
         index_q_fp8.stride(0),
         index_q_fp8.stride(1),
         index_q_head_dim,
         ql_nope,
         ql_nope.stride(0),
         ql_nope.stride(1),
-        mqa_q_fp8,
-        mqa_q_fp8.stride(0),
-        mqa_q_fp8.stride(1),
+        mqa_q_fp8_u8,
+        mqa_q_fp8_u8.stride(0),
+        mqa_q_fp8_u8.stride(1),
         q_scale,
         ql_nope.shape[2],
         triton.next_power_of_2(ql_nope.shape[2]),
