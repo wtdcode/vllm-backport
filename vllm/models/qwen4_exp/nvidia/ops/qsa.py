@@ -24,6 +24,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    # FP8KV-PORT:ops-kernel-signature -- host-side dequant scales; k_scale
+    # is pre-multiplied into softmax_scale, v_scale is the output scale.
+    softmax_scale,
+    output_scale,
     stride_q_row,
     stride_q_head,
     stride_k_block,
@@ -49,6 +53,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_FP8: tl.constexpr,  # FP8KV-PORT:ops-is-fp8-constexpr
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -78,7 +83,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
-    softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
+    # FP8KV-PORT:ops-score-scale -- softmax_scale is the host-side
+    # attention scale (1/sqrt(head_dim), with the fp8 K dequant scale
+    # already pre-multiplied in); convert to log2 units once here for
+    # the exp2-based online softmax.
+    score_scale = softmax_scale * 1.4426950408889634
 
     tile_end = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
 
@@ -126,15 +135,27 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if IS_FP8:
+            # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype
+            # (fp8 QK measured slower here and less accurate).
+            keys = keys.to(query.dtype)  # FP8KV-PORT:ops-keys-upcast
         scores = tl.dot(query, keys)
-        # Scaling scores avoids re-quantizing a scaled query to BF16.
-        scores *= softmax_scale_log2
+        # Scaling scores avoids re-quantizing a scaled query to BF16; for
+        # fp8 caches the K dequant scale is already folded into
+        # softmax_scale on the host.
+        scores *= score_scale
         scores = tl.where(valid[None, :], scores, -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
         alpha = tl.math.exp2(max_value - next_max)
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
+        if IS_FP8:
+            # Dequant V to fp16 (not bf16) for the PV dot: P <= 1 (online
+            # softmax) so fp16 has the range, its wider mantissa is more
+            # accurate, and the fp8->fp16 upcast with an fp16 PV dot is
+            # faster.
+            values = values.to(tl.float16)  # FP8KV-PORT:ops-values-upcast
         accumulator = tl.dot(
             probabilities.to(values.dtype),
             values,
@@ -144,9 +165,15 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         max_value = next_max
 
     has_values = normalizer > 0
+    # FP8KV-PORT:ops-output-scale -- fold the fp8 V dequant scale
+    # (output_scale, 1.0 for bf16) into a per-row reciprocal, so the
+    # output is a per-row multiply rather than a HEAD_DIM-wide scale.
+    # The split-K LSE below keeps the *unscaled* normalizer; see the
+    # merge kernel, which renormalizes, so the V scale cancels exactly.
+    inv_normalizer = output_scale / tl.maximum(normalizer, 1.0e-20)
     normalized_output = tl.where(
         has_values[:, None],
-        accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
+        accumulator * inv_normalizer[:, None],
         0.0,
     )
     output_mask = head_offsets[:, None] < GROUP_SIZE
@@ -455,14 +482,22 @@ def qsa_sparse_paged_attention(
     token_to_req: torch.Tensor,
     use_prefill_config: bool,
     out: torch.Tensor | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches.
+    """Run sparse GQA directly over paged BF16 or FP8-e4m3 K/V caches.
 
     logical_indices is the PACKED selection buffer: [rows, selection_width + 1]
     with the trailing column holding each row's valid-entry count (written by
     the expand kernel; never a token index). The kernel reads it as the
     tile-loop bound. use_prefill_config only steers the top of the config table; see
     _select_config.
+
+    With fp8 caches, k_scale/v_scale are the layer's per-tensor dequant scales as
+    host floats (e.g. layer._k_scale_float/_v_scale_float): k_scale is
+    pre-multiplied into the softmax scale and v_scale becomes the kernel's output
+    scale, so the kernel needs no device scale buffers.
+    FP8KV-PORT:ops-wrapper-signature
     """
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -480,7 +515,19 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+    assert q.dtype == torch.bfloat16
+    assert k_cache.dtype == v_cache.dtype
+    is_fp8 = k_cache.dtype == torch.float8_e4m3fn  # FP8KV-PORT:ops-dtype-guard
+    if is_fp8:
+        assert k_scale is not None and v_scale is not None
+        # Host pre-multiply: fold the K dequant scale into the attention
+        # scale and pass V's dequant scale as the kernel's output scale.
+        softmax_scale = (head_dim**-0.5) * float(k_scale)
+        output_scale = float(v_scale)
+    else:
+        assert k_cache.dtype == torch.bfloat16
+        softmax_scale = head_dim**-0.5
+        output_scale = 1.0
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -505,6 +552,24 @@ def qsa_sparse_paged_attention(
     block_n, partial_warps, num_tiles, num_splits = _select_config(
         q.shape[0], k_cache.shape[2], use_prefill_config, selection_width
     )
+
+    # FP8KV-PORT:ops-stage-helper
+    # Pipeline stages are chosen per cache dtype.  Upstream's fp8 branch was
+    # forced to a single stage by the per-thread-block dynamic shared memory
+    # opt-in ceiling of 99 KB (101,376 B), which is the same on Ada (SM89) as
+    # on the consumer Blackwell part they measured (106,496 B requested at
+    # BLOCK_N=64 with two stages).  Measured on our fork and our SM89 target,
+    # that ceiling is NOT binding: the e4m3 tiles are stored narrow in shared
+    # memory and upcast in registers, so the fp8 variant needs LESS shared
+    # memory than bf16 (BLOCK_N=64: 43,008 B vs 75,776 B at two stages;
+    # 24,576 B at one).  The single stage is therefore kept as the
+    # conservative, explicitly-specified choice for the new fp8 path -- not as
+    # a hard requirement -- and it incidentally improves occupancy (24 KB vs
+    # 43 KB per block).  The bf16 path is left exactly as it is today.
+    def _qsa_pipeline_stages(is_fp8: bool) -> int:
+        return 1 if is_fp8 else 2
+
+    main_num_stages = _qsa_pipeline_stages(k_cache.dtype == torch.float8_e4m3fn)
 
     # Split=1 writes output directly and compiles out all workspace accesses.
     if num_splits == 1:
@@ -533,6 +598,8 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        softmax_scale,  # FP8KV-PORT:ops-launch-scales
+        output_scale,
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -558,8 +625,9 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        IS_FP8=is_fp8,  # FP8KV-PORT:ops-launch-is-fp8
         num_warps=partial_warps,
-        num_stages=2,
+        num_stages=main_num_stages,
     )
     if num_splits == 1:
         return out
@@ -608,6 +676,18 @@ def warmup_qsa_sparse_paged_attention(
     # on the kernels, so any value here compiles the only variant.
     num_rows = 16
     num_requests = 16
+    # FP8KV-PORT:ops-warmup-scale-locals -- the engine hands this function the
+    # raw owner.kv_cache, which the fp8 KV path allocates as uint8.  The runtime
+    # path views those bytes as e4m3 in the attention backend before they reach
+    # the kernel, so do the same here; otherwise IS_FP8 compiles as False while
+    # the pointer stays uint8 and Triton rejects tl.dot(bf16, uint8)
+    # ("Both operands must be same dtype. Got bf16 and uint8").
+    if key_cache.dtype == torch.uint8:
+        key_cache = key_cache.view(torch.float8_e4m3fn)
+        value_cache = value_cache.view(torch.float8_e4m3fn)
+    is_fp8 = key_cache.dtype == torch.float8_e4m3fn
+    warmup_softmax_scale = head_dim**-0.5
+    warmup_output_scale = 1.0
     q_ptr = TritonWarmupTensor(
         torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
     )
@@ -659,6 +739,8 @@ def warmup_qsa_sparse_paged_attention(
             partial_output_ptr,
             partial_lse_ptr,
             output_ptr,
+            warmup_softmax_scale,  # FP8KV-PORT:ops-warmup-launch-scales
+            warmup_output_scale,
             row_stride,
             head_stride,
             key_cache.stride(0),
@@ -684,6 +766,7 @@ def warmup_qsa_sparse_paged_attention(
             NUM_TILES=num_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
+            IS_FP8=is_fp8,  # FP8KV-PORT:ops-warmup-launch-is-fp8
             num_warps=warps,
             num_stages=2,
             grid=(num_rows, num_kv_heads, num_splits),
