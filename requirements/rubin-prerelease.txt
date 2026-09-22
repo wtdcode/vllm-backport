@@ -13,4 +13,4 @@ torchaudio==2.11.0.dev20260903+cu134
 # INSTALL_RUBIN_PRERELEASE=true, so they must be pinned here instead to
 # still get installed.
 nvidia-cutlass-dsl[cu13]==4.8.0.dev0
-flashinfer-python==0.6.18
+flashinfer-python==0.7.0
