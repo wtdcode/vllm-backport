@@ -167,6 +167,7 @@ class DFlashQwen3Attention(nn.Module):
         rms_norm_eps: float = 1e-06,
         attention_bias: bool = False,
         add_swa_attention_sink_bias: bool = False,
+        v_scale: float | None = None,
         sliding_window: int | None = None,
         causal: bool = False,
         is_neox_style: bool = True,
@@ -223,6 +224,10 @@ class DFlashQwen3Attention(nn.Module):
             else None
         )
 
+        # MiMo DFlash drafts scale V by `attention_value_scale`. Attention is
+        # linear in V (the sink column carries no value), so scaling the
+        # output covers both the pre-inserted context V and the query V.
+        self.v_scale = v_scale
         self.sliding_window = sliding_window
         self.attn = Attention(
             self.num_heads,
@@ -264,6 +269,8 @@ class DFlashQwen3Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
+        if self.v_scale is not None:
+            attn_output = attn_output * self.v_scale
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -311,6 +318,9 @@ class DFlashQwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=getattr(config, "attention_bias", False),
             add_swa_attention_sink_bias=add_swa_attention_sink_bias,
+            v_scale=dflash_config.get(
+                "attention_value_scale", getattr(config, "attention_value_scale", None)
+            ),
             sliding_window=sliding_window,
             causal=causal,
             is_neox_style=is_neox_style,
