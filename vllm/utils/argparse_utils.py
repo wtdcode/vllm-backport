@@ -34,9 +34,16 @@ def human_readable_int(value: str) -> int:
     - '1k' -> 1,000
     - '1K' -> 1,024
     - '25.6k' -> 25,600
+    - '11GiB' -> 11 * 2**30 (IEC suffixes alias their binary uppercase)
+
+    IEC-style two-letter suffixes (kiB, MiB, GiB, TiB) are accepted as
+    aliases of the binary uppercase suffixes, since the engine's own logs
+    (e.g. the --kv-cache-memory hint in gpu_worker) print sizes as
+    "(N GiB)", which invites users to paste that form back.
     """
     value = value.strip()
 
+    value = re.sub(r"([kKmMgGtT])i?[bB]$", r"\1", value)
     match = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMgGtT])", value)
     if match:
         decimal_multiplier = {
