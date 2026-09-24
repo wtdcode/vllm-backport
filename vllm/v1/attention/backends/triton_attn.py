@@ -479,8 +479,13 @@ class TritonAttentionImpl(AttentionImpl):
             cap = current_platform.get_device_capability()
             cap_str = cap.as_version_str() if cap is not None else "unknown"
             dev = current_platform.get_device_name()
-            if self.kv_cache_dtype.startswith("fp8") and not (
-                current_platform.has_device_capability(89)
+            if (
+                self.kv_cache_dtype.startswith("fp8")
+                and not current_platform.has_device_capability(89)
+                # Subclasses that dequantize fp8 K/V without native fp8
+                # math (e.g. the DiffKV LUT path on Ampere) opt out of the
+                # architectural gate by setting this class attribute.
+                and not getattr(self, "fp8_kv_lut_dequant", False)
             ):
                 suggested = (
                     "float16" if (cap is None or cap.to_int() < 80) else "bfloat16"

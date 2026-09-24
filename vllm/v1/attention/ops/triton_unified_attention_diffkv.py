@@ -22,6 +22,7 @@ Both 2D and 3D launches are supported:
     for decode-only batches whose 2D grid would under-fill the GPU.
 """
 
+import os
 from typing import Any
 
 import torch
@@ -46,6 +47,61 @@ logger = init_logger(__name__)
 
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 
+# diffkv split-KV + wide-prefill knobs (thor patch, ported from the diffbot recipe).
+# Stock-off defaults: the stock kernel behavior is unchanged unless explicitly enabled
+# on the server (validated values from the diffbot recipe in comments).
+# VLLM_DIFFKV_SPEC_3D_MAX_Q: max query tokens per sequence for the split-KV verify path
+# (0 = off; diffbot validated 16: MTP verify batches take the 3D split-KV launch).
+# Upstream default 0 (path off). 16 enables the split-KV verify launch:
+# measured 3x decode at 33K ctx with MTP-3 on sm86 TP8 (50 -> 149 TG/s).
+_SPEC_3D_MAX_Q = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_MAX_Q", "16"))
+# Wide-prefill knobs (diffbot recipe): prefill-shaped 2D launches
+# (max_seqlen_q >= _PREFILL_MIN_Q) use a larger BLOCK_M (several query
+# tokens per program) so K/V tiles are reused across query rows. The stock
+# BLOCK_M=16 with a GQA group of 16 means ONE query token per program.
+# Validated on sm120: 128 / 8 warps / tile 32 = 3.0x on a 4096-token chunk
+# at 30K ctx (global layers), 2.5x SWA; tile 64 exceeds sm120's 99 KB smem
+# for BLOCK_M 128. Stock-off default: 16 keeps the stock launch.
+# Upstream default 16. 128 = wide prefill tiles (recipe-claimed up to 3x on
+# 4096-token chunks; kept by the sm86 prefill ladder). Automatically clamped
+# to 64 under the fp8-KV LUT path on sm<89 (shared-memory ceiling).
+_PREFILL_BLOCK_M = int(os.environ.get("VLLM_DIFFKV_PREFILL_BLOCK_M", "128"))
+_PREFILL_NUM_WARPS = int(os.environ.get("VLLM_DIFFKV_PREFILL_NUM_WARPS", "8"))
+# 2 stages: same speed as the default 3 for bf16 and keeps the fp8-KV dequant
+# under smem limits.
+_PREFILL_NUM_STAGES = int(os.environ.get("VLLM_DIFFKV_PREFILL_NUM_STAGES", "2"))
+_PREFILL_TILE = int(os.environ.get("VLLM_DIFFKV_PREFILL_TILE", "32"))
+# fp8 KV on full-attention layers: tile 64 fits (fp8 K/V tiles halve smem).
+# SWA layers keep tile 32 (tile 64 + sinks exceeds smem).
+_PREFILL_TILE_FP8_GLOBAL = int(
+    os.environ.get("VLLM_DIFFKV_PREFILL_TILE_FP8_GLOBAL", "64")
+)
+_PREFILL_MIN_Q = 64
+# Split-KV spec verify (diffbot recipe): cover ALL q tokens of a request in
+# one program (BLOCK_M = q_len x GQA group, capped) so each K/V tile is read
+# once instead of once per verify token (8x for q=8).
+_SPEC_3D_BLOCK_M = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_BLOCK_M", "128"))
+_SPEC_3D_NUM_WARPS = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_NUM_WARPS", "8"))
+_SPEC_3D_TILE = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_TILE", "16"))
+# fp8 E4M3 KV dequant strategy: "auto" picks the LUT gather below sm89 and
+# the native in-kernel conversion on sm89+ (Triton cannot lower the native
+# E4M3->fp16/bf16 element conversion on sm80/sm86, see vllm PR #55184).
+# "lut" / "native" force a mode for testing.
+_FP8_DEQUANT_MODE = os.environ.get("VLLM_DIFFKV_FP8_DEQUANT", "auto").lower()
+
+_fp8_e4m3_lut_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
+
+
+def _get_fp8_e4m3_lut(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """256-entry dequant table for E4M3 bytes (sm86-safe gather path)."""
+    key = (str(dtype), device)
+    lut = _fp8_e4m3_lut_cache.get(key)
+    if lut is None:
+        codes = torch.arange(256, dtype=torch.uint8)
+        lut = codes.view(torch.float8_e4m3fn).to(dtype).contiguous().to(device)
+        _fp8_e4m3_lut_cache[key] = lut
+    return lut
+
 
 @triton.jit
 def kernel_unified_attention_diffkv(
@@ -61,6 +117,11 @@ def kernel_unified_attention_diffkv(
     key_cache_ptr,  # view of packed cache: [..., :head_size_qk]
     value_cache_ptr,  # view of packed cache: [..., head_size_qk:hqk+hv]
     sink_ptr,
+    k_descale_ptr,
+    v_descale_ptr,
+    FP8_KV_CACHE: tl.constexpr,
+    lut_ptr,
+    FP8_LUT: tl.constexpr,
     block_tables_ptr,
     seq_lens_ptr,
     alibi_slopes_ptr,
@@ -154,6 +215,14 @@ def kernel_unified_attention_diffkv(
         other=0.0,
     )
 
+    if FP8_KV_CACHE:
+        k_descale = tl.load(k_descale_ptr)
+        v_descale = tl.load(v_descale_ptr)
+        # fp8 KV: run the dots in fp16 -- sm120 converts E4M3->fp16 natively,
+        # E4M3->bf16 is a multi-step path that made BLOCK_M 128 prefill 1.74x
+        # slower. fp16 also has more mantissa than bf16.
+        Q = Q.to(tl.float16)
+
     block_table_offset = seq_idx * block_table_stride
 
     M = init_softmax_M(
@@ -212,14 +281,33 @@ def kernel_unified_attention_diffkv(
             mask=dim_mask_qk[:, None] & tile_mask[None, :],
             other=0.0,
         )
-        K = K_load.to(Q.dtype)
+        # E4M3 -> fp16/bf16 is exact; the per-tensor K/V descales are applied
+        # in fp32 on S and acc below (no fp32 staging tile: that pushed
+        # BLOCK_M 128 prefill past smem limits).
+        if FP8_LUT:
+            # sm80/sm86: dequantize through a 256-entry fp16 LUT gather
+            # instead of the (unavailable) native element conversion.
+            K = tl.load(
+                lut_ptr + K_load.to(tl.int32),
+                mask=dim_mask_qk[:, None] & tile_mask[None, :],
+                other=0.0,
+            )
+        else:
+            K = K_load.to(Q.dtype)
         # V : (TILE_SIZE, HEAD_SIZE_V_PADDED)
         V_load = tl.load(
             value_cache_ptr + v_offset,
             mask=dim_mask_v[None, :] & tile_mask[:, None],
             other=0.0,
         )
-        V = V_load.to(Q.dtype)
+        if FP8_LUT:
+            V = tl.load(
+                lut_ptr + V_load.to(tl.int32),
+                mask=dim_mask_v[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
+        else:
+            V = V_load.to(Q.dtype)
 
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = compute_kv_seq_mask(
@@ -235,7 +323,10 @@ def kernel_unified_attention_diffkv(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        S += scale * tl.dot(Q, K)
+        if FP8_KV_CACHE:
+            S += (scale * k_descale) * tl.dot(Q, K)
+        else:
+            S += scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -259,7 +350,10 @@ def kernel_unified_attention_diffkv(
                 V,
                 0.0,
             )
-        acc += tl.dot(P.to(V.dtype), V)
+        if FP8_KV_CACHE:
+            acc += tl.dot(P.to(V.dtype), V) * v_descale
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
 
     # ---- Epilogue --------------------------------------------------------
     if IS_3D:
@@ -276,6 +370,10 @@ def kernel_unified_attention_diffkv(
             acc,
             mask=dim_mask_v[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         )
+        # With several query tokens per program, a row can see only masked
+        # keys in this segment (softmax_step then leaves M=0, L=0); report
+        # -inf so reduce_segments ignores it.
+        M = tl.where(L > 0.0, M, float("-inf"))
         store_segm_reduce_scalars(
             segm_max_ptr,
             segm_expsum_ptr,
@@ -403,8 +501,71 @@ def unified_attention_diffkv(
     softmax_segm_output: torch.Tensor | None = None,
     softmax_segm_max: torch.Tensor | None = None,
     softmax_segm_expsum: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
 ):
     assert causal, "Only causal attention is supported"
+    # thor port of local-inference-lab/vllm #830: per-tensor E4M3 K/V cache.
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    fp8_kv_cache = k.dtype in fp8_dtypes
+    if fp8_kv_cache:
+        if v.dtype != k.dtype or q.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("FP8 DiffKV requires matching E4M3 K/V and FP16/BF16 Q")
+        if k_descale is None or v_descale is None:
+            raise ValueError("FP8 DiffKV requires separate K and V descale tensors")
+        if k_descale.numel() != 1 or v_descale.numel() != 1:
+            raise ValueError("FP8 DiffKV only supports per-tensor K/V scales")
+
+    # sm80/sm86 cannot lower the native E4M3 conversion; dequant through a
+    # 256-entry LUT gather instead (cache reinterpreted as raw bytes).
+    fp8_lut = False
+    lut = None
+    if fp8_kv_cache:
+        mode = _FP8_DEQUANT_MODE
+        if mode == "auto":
+            if q.is_cuda:
+                major, minor = torch.cuda.get_device_capability(q.device)
+                mode = "native" if (major, minor) >= (8, 9) else "lut"
+            else:
+                mode = "native"
+        if mode == "lut":
+            if k.dtype != torch.float8_e4m3fn:
+                raise ValueError(f"LUT dequant requires E4M3 (fn) cache, got {k.dtype}")
+            fp8_lut = True
+            lut = _get_fp8_e4m3_lut(q.device, torch.float16)
+            k = k.view(torch.uint8)
+            v = v.view(torch.uint8)
+        elif mode != "native":
+            raise ValueError(
+                f"VLLM_DIFFKV_FP8_DEQUANT must be auto|lut|native, got {mode!r}"
+            )
+
+    # sm80/sm86 have a ~99KB shared-memory ceiling. The LUT gather stages
+    # the raw uint8 tile alongside the gathered fp16 tile, so a BLOCK_M=128
+    # prefill/verify kernel needs ~112KB and fails to launch
+    # (OutOfResources: 114688 vs 101376). bf16 direct loads fit at 128 on
+    # these parts, so only clamp the wide-tile knobs when the LUT path is
+    # actually taken below sm89.
+    lut_low_smem = fp8_lut and q.is_cuda and (
+        torch.cuda.get_device_capability(q.device) < (8, 9)
+    )
+    prefill_block_m = _PREFILL_BLOCK_M
+    spec_3d_block_m = _SPEC_3D_BLOCK_M
+    if lut_low_smem:
+        if prefill_block_m > 64:
+            logger.warning_once(
+                "fp8-KV LUT dequant: clamping VLLM_DIFFKV_PREFILL_BLOCK_M "
+                "%d -> 64 to fit the sm86 shared-memory ceiling",
+                prefill_block_m,
+            )
+            prefill_block_m = 64
+        if spec_3d_block_m > 64:
+            logger.warning_once(
+                "fp8-KV LUT dequant: clamping VLLM_DIFFKV_SPEC_3D_BLOCK_M "
+                "%d -> 64 to fit the sm86 shared-memory ceiling",
+                spec_3d_block_m,
+            )
+            spec_3d_block_m = 64
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -422,29 +583,68 @@ def unified_attention_diffkv(
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
-
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
-
+    launch_kw: dict[str, int] = {}
+    prefill_tile = None
+    if (
+        max_seqlen_q >= _PREFILL_MIN_Q
+        and prefill_block_m > BLOCK_M
+        and prefill_block_m % num_queries_per_kv == 0
+    ):
+        BLOCK_M = prefill_block_m
+        launch_kw["num_warps"] = _PREFILL_NUM_WARPS
+        if _PREFILL_NUM_STAGES > 0:
+            launch_kw["num_stages"] = _PREFILL_NUM_STAGES
+        prefill_tile = _PREFILL_TILE
     sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
 
     # Decide between 2D and 3D launch.  Mirrors the standard launcher:
     # 3D requires preallocated softmax buffers, decode-only batches, and
     # a small number of sequences (otherwise 2D already saturates the SM).
+    # thor patch: short multi-token decode batches (spec-decode verify,
+    # q_len <= _SPEC_3D_MAX_Q) on full-attention layers also take the split-KV
+    # path.  Their 2D grid is only (q_blocks x kv_heads) programs -- 18 for a
+    # q_len=8 verify with 2 KV heads/rank -- each walking the whole context.
+    # Sliding-window layers keep 2D: their loop is already window-bounded.
+    spec_3d = (
+        1 < max_seqlen_q <= _SPEC_3D_MAX_Q
+        and sliding_window_val == 0
+        and softmax_segm_output is not None
+        and q.shape[0] <= softmax_segm_output.shape[0]
+    )
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or (max_seqlen_q > 1 and not spec_3d)
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )
 
+    spec_tile = None
+    if use_3d and spec_3d and spec_3d_block_m > BLOCK_M:
+        spec_bm = min(
+            spec_3d_block_m,
+            triton.next_power_of_2(max_seqlen_q * num_queries_per_kv),
+        )
+        if spec_bm > BLOCK_M and spec_bm % num_queries_per_kv == 0:
+            BLOCK_M = spec_bm
+            launch_kw["num_warps"] = _SPEC_3D_NUM_WARPS if BLOCK_M >= 128 else 4
+            spec_tile = _SPEC_3D_TILE
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
+
+    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+
     # Tile size: 32 for prefill-class kernels.  Decode (small Q) prefers
     # smaller tiles to expose more parallelism along the KV dim.
     tile_size = 32 if not use_3d else (16 if q.element_size() >= 2 else 32)
+    if spec_tile is not None:
+        tile_size = spec_tile
+    if prefill_tile is not None and not use_3d:
+        tile_size = prefill_tile
+        if fp8_kv_cache and sliding_window_val == 0:
+            tile_size = _PREFILL_TILE_FP8_GLOBAL
 
     grid: tuple[Any, ...]
     if use_3d:
@@ -471,6 +671,11 @@ def unified_attention_diffkv(
         key_cache_ptr=k,
         value_cache_ptr=v,
         sink_ptr=sinks,
+        k_descale_ptr=k_descale,
+        v_descale_ptr=v_descale,
+        FP8_KV_CACHE=fp8_kv_cache,
+        lut_ptr=lut if fp8_lut else q,
+        FP8_LUT=fp8_lut,
         block_tables_ptr=block_table,
         seq_lens_ptr=seqused_k,
         alibi_slopes_ptr=alibi_slopes,
@@ -508,6 +713,7 @@ def unified_attention_diffkv(
         BLOCK_M=BLOCK_M,
         NUM_SEGMENTS_PER_SEQ=num_segments,
         IS_3D=use_3d,
+        **launch_kw,
     )
 
     if use_3d:

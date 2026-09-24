@@ -110,13 +110,16 @@ class MiMoVisionPatchMerger(nn.Module):
         self.hidden_size = context_dim * (spatial_merge_size**2)
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.ln_q = norm_layer(context_dim)
+        # The checkpoint's merger ln_q is nn.LayerNorm (weight+bias), not the
+        # RMSNorm the vision transformer passes in. Match the checkpoint
+        # exactly.
+        self.ln_q = nn.LayerNorm(context_dim, eps=1e-6)
 
         self.mlp = nn.Sequential(
             ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
-                bias=False,
+                bias=True,  # checkpoint merger.mlp.0 has bias
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp.0",
                 return_bias=False,
@@ -126,7 +129,7 @@ class MiMoVisionPatchMerger(nn.Module):
             RowParallelLinear(
                 self.hidden_size,
                 d_model,
-                bias=False,
+                bias=True,  # checkpoint merger.mlp.2 has bias
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp.2",
                 return_bias=False,
@@ -1285,7 +1288,17 @@ class MiMoV2OmniForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQ
         audio_config = getattr(config, "audio_config", None)
         model_path = vllm_config.model_config.model
         self.audio_encoder: MimoAudioEncoder | None
-        if audio_config is not None:
+        # Skip the audio tower entirely when the serving config allows no
+        # audio items (limit_mm_per_prompt audio=0 or language_model_only):
+        # it is never exercised and only costs load time and VRAM. Same
+        # gate as nano_nemotron_vl's multimodal weight loading.
+        mm_config = vllm_config.model_config.get_multimodal_config()
+        audio_needed = audio_config is not None and (
+            mm_config is None
+            or mm_config.get_limit_per_prompt("audio") != 0
+            or mm_config.enable_mm_embeds
+        )
+        if audio_needed:
             with self._mark_tower_model(vllm_config, "audio"):
                 self.audio_encoder = MimoAudioEncoder(
                     audio_config, model_path=model_path
@@ -1578,6 +1591,16 @@ class MiMoV2OmniForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQ
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         audio_loaded: set[str] = set()
+
+        if self.audio_encoder is None:
+            # Tower not built (audio limit 0): drop its checkpoint weights
+            # instead of failing AutoWeightsLoader on missing modules.
+            audio_prefixes = ("audio_encoder.", "speech_embeddings.")
+            weights = (
+                (name, tensor)
+                for name, tensor in weights
+                if not name.startswith(audio_prefixes)
+            )
 
         loader = AutoWeightsLoader(self)
         auto_loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

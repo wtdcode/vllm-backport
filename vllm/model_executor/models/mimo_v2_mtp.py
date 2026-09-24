@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from vllm.config import VllmConfig
+from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -45,7 +45,7 @@ from .interfaces import (
     SupportsMultiModal,
     _require_is_multimodal,
 )
-from .mimo_v2 import MiMoV2Attention, MiMoV2MLP
+from .mimo_v2 import MiMoV2Attention, MiMoV2MLP, _shard_fp8_qkv_proj
 from .utils import _merge_multimodal_embeddings, maybe_prefix
 
 # MiMo-V2 checkpoints contain multiple MTP layers, but vLLM currently supports
@@ -65,6 +65,7 @@ class MiMoV2MTPLayer(nn.Module):
         config: PretrainedConfig,
         prefix: str,
         quant_config: QuantizationConfig | None = None,
+        cache_config: CacheConfig | None = None,
     ) -> None:
         super().__init__()
 
@@ -100,6 +101,7 @@ class MiMoV2MTPLayer(nn.Module):
             layer_id=0,
             rope_theta=swa_rope_theta,
             max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
+            cache_config=cache_config,
             quant_config=quant_config,
             partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
             prefix=f"{prefix}.self_attn",
@@ -149,6 +151,7 @@ class _MiMoV2MTPLayers(nn.Module):
         num_mtp_layers: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
+        cache_config: CacheConfig | None = None,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleDict(
@@ -157,6 +160,7 @@ class _MiMoV2MTPLayers(nn.Module):
                     config=config,
                     prefix=f"{prefix}.{i}",
                     quant_config=quant_config,
+                    cache_config=cache_config,
                 )
                 for i in range(num_mtp_layers)
             }
@@ -183,6 +187,7 @@ class MiMoV2MultiTokenPredictor(nn.Module):
             config=config,
             num_mtp_layers=num_mtp_layers,
             quant_config=vllm_config.quant_config,
+            cache_config=vllm_config.cache_config,
             prefix=maybe_prefix(prefix, "mtp.layers"),
         )
 
@@ -266,6 +271,7 @@ class MiMoV2MTP(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        fp8_qkv_pending: dict[str, dict[str, torch.Tensor]] = {}
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -279,18 +285,83 @@ class MiMoV2MTP(nn.Module):
             ):
                 continue
 
-            # Support fused qkv_proj checkpoint (Pro format).
-            # The checkpoint is stored pre-sharded for TP=8 as
-            # [Q_rank0, K_rank0, V_rank0, Q_rank1, ...], so splitting along
-            # dim 0 with chunk(tp_size) gives each rank its Q+K+V slice for
-            # both the FP8 weight and the block weight_scale_inv. This matches
-            # how the main model loads the same layout.
+            # Fused qkv_proj (Pro format): the checkpoint stores the fused
+            # QKV pre-sharded for the quant-time TP (NB=4 blocks of
+            # [Q|K|V]), the same layout as the main model — NOT per-serving-
+            # rank slices, so a plain chunk(tp_size) scrambles K/V and
+            # mis-slices the fp8 block scales. The fp8 weight and its
+            # weight_scale_inv arrive as separate tensors and are sharded
+            # together once both are buffered.
             if "qkv_proj" in name:
-                if name in params_dict:
-                    param = params_dict[name]
-                    loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
-                    default_weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
+                base, _, kind = name.rpartition(".")
+                if f"{base}.weight" not in params_dict:
+                    # The draft model builds only the MTP layers it uses
+                    # (EAGLE semantics: one reused layer); skip the rest.
+                    continue
+                is_fp8_weight = kind == "weight" and (
+                    loaded_weight.dtype == torch.float8_e4m3fn
+                )
+                is_scale = kind == "weight_scale_inv"
+                if is_fp8_weight or is_scale:
+                    entry = fp8_qkv_pending.setdefault(base, {})
+                    entry["w" if is_fp8_weight else "s"] = loaded_weight
+                    if "w" not in entry or "s" not in entry:
+                        continue
+                    del fp8_qkv_pending[base]
+                    attn = self.get_submodule(base.rsplit(".qkv_proj", 1)[0])
+                    w_r, s_r = _shard_fp8_qkv_proj(
+                        entry["w"],
+                        entry["s"],
+                        num_heads=attn.total_num_heads,
+                        num_kv_heads=attn.total_num_kv_heads,
+                        head_dim=attn.head_dim,
+                        v_head_dim=attn.v_head_dim,
+                        tp_rank=tp_rank,
+                        tp_size=tp_size,
+                    )
+                    for pname, tensor in (
+                        (f"{base}.weight", w_r),
+                        (f"{base}.weight_scale_inv", s_r),
+                    ):
+                        param = params_dict[pname]
+                        if tensor.shape[0] > param.shape[0]:
+                            tensor = tensor[: param.shape[0]]
+                        default_weight_loader(param, tensor)
+                        loaded_params.add(pname)
+                    continue
+                if kind == "weight" and base in {
+                    n[: -len(".weight")] for n in params_dict
+                }:
+                    # Unquantized fused qkv: de-shard the NB=4 blocks into
+                    # head-ordered all_q/all_k/all_v and slice for this rank
+                    # (no scale constraint, rows may split anywhere).
+                    nb = 4
+                    attn = self.get_submodule(base.rsplit(".qkv_proj", 1)[0])
+                    nh = attn.total_num_heads
+                    nkv = attn.total_num_kv_heads
+                    hd = attn.head_dim
+                    vhd = attn.v_head_dim
+                    bq = (nh // nb) * hd
+                    bk = (nkv // nb) * hd
+                    bv = (nkv // nb) * vhd
+                    blocks = loaded_weight.view(nb, bq + bk + bv, -1)
+                    all_q = blocks[:, :bq, :].reshape(nh * hd, -1)
+                    all_k = blocks[:, bq : bq + bk, :].reshape(nkv * hd, -1)
+                    all_v = blocks[:, bq + bk :, :].reshape(nkv * vhd, -1)
+                    nhr = nh // tp_size
+                    q = all_q[tp_rank * nhr * hd : (tp_rank + 1) * nhr * hd, :]
+                    if nkv >= tp_size:
+                        kvr = nkv // tp_size
+                        k = all_k[tp_rank * kvr * hd : (tp_rank + 1) * kvr * hd, :]
+                        v = all_v[tp_rank * kvr * vhd : (tp_rank + 1) * kvr * vhd, :]
+                    else:
+                        kvi = tp_rank // (tp_size // nkv)
+                        k = all_k[kvi * hd : (kvi + 1) * hd, :]
+                        v = all_v[kvi * vhd : (kvi + 1) * vhd, :]
+                    default_weight_loader(
+                        params_dict[f"{base}.weight"], torch.cat([q, k, v], dim=0)
+                    )
+                    loaded_params.add(f"{base}.weight")
                 continue
 
             # gate_proj/up_proj → gate_up_proj stacking (both formats);

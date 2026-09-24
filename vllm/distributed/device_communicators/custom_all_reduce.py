@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import contextmanager
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -31,6 +32,35 @@ except ImportError:
     torch_symm_mem = None
 
 logger = init_logger(__name__)
+
+
+def custom_ar_enforced_size_mb_from_config(vllm_config: Any = None) -> int | None:
+    """Return the enforced custom-AR cutoff in MiB, sized from the config.
+
+    Targets the largest activation all-reduce (the chunked-prefill batch:
+    ``max_num_batched_tokens x hidden_size x dtype bytes``) with 25%
+    headroom for speculative-decode verify batches, floored at the 8 MiB
+    default. Returns None when no config is active so callers keep the
+    default cutoff.
+    """
+    if vllm_config is None:
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            logger.warning_once(
+                "VLLM_CUSTOM_AR_MAX_SIZE_MB=auto: no active vLLM config at "
+                "communicator init; keeping the default cutoff."
+            )
+            return None
+    tokens = max(
+        vllm_config.scheduler_config.max_num_batched_tokens,
+        vllm_config.scheduler_config.max_num_seqs,
+    )
+    hidden = vllm_config.model_config.hf_config.get_text_config().hidden_size
+    elem = 4 if vllm_config.model_config.dtype == torch.float32 else 2
+    auto_bytes = int(tokens * hidden * elem * 1.25)
+    return max(8, -(-auto_bytes // (1024 * 1024)))
 
 
 def _has_local_multicast_support(device: torch.device) -> bool:
@@ -218,6 +248,22 @@ class CustomAllreduce:
                     CUSTOM_ALL_REDUCE_MAX_SIZES[device_capability_str][world_size],
                     max_size,
                 )
+        # VLLM_CUSTOM_AR_ENFORCE=1 keeps activation all-reduces on the custom
+        # P2P path by raising the cutoff to the largest message the engine
+        # sends (chunked-prefill batch + speculative headroom), instead of
+        # falling back to NCCL above the 8 MiB default. Useful on
+        # fully-connected P2P topologies (e.g. 8x3090 over PCIe) where custom
+        # AR outperforms NCCL. The worker resolves the size before the
+        # distributed environment initializes and hands it over via the
+        # internal VLLM_CUSTOM_AR_ENFORCED_MB variable (the global config
+        # context is not active yet here).
+        enforced_mb = os.environ.get("VLLM_CUSTOM_AR_ENFORCED_MB")
+        if enforced_mb is not None:
+            max_size = max(int(enforced_mb) * 1024 * 1024, max_size)
+        elif envs.VLLM_CUSTOM_AR_ENFORCE:
+            resolved_mb = custom_ar_enforced_size_mb_from_config()
+            if resolved_mb is not None:
+                max_size = max(resolved_mb * 1024 * 1024, max_size)
         # device.index is a visible ordinal, not a logical local ID.
         fully_connected = False
         if same_node:

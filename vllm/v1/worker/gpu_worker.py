@@ -355,6 +355,23 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        # VLLM_CUSTOM_AR_ENFORCE=1: resolve the enforced custom-AR cutoff
+        # before the distributed environment initializes CustomAllreduce —
+        # the global config context is not active yet at that point, but the
+        # worker owns its VllmConfig here.
+        if envs.VLLM_CUSTOM_AR_ENFORCE and not os.environ.get(
+            "VLLM_CUSTOM_AR_ENFORCED_MB"
+        ):
+            from vllm.distributed.device_communicators.custom_all_reduce import (
+                custom_ar_enforced_size_mb_from_config,
+            )
+
+            enforced_mb = custom_ar_enforced_size_mb_from_config(
+                self.vllm_config
+            )
+            if enforced_mb is not None:
+                os.environ["VLLM_CUSTOM_AR_ENFORCED_MB"] = str(enforced_mb)
+
         # Give every worker process its own Triton JIT cache. By default all
         # local ranks share one cache directory; concurrent compile+load of
         # the same freshly-written kernel across ranks can read a partially

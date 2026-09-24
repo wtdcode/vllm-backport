@@ -134,6 +134,11 @@ if TYPE_CHECKING:
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
+    VLLM_CUSTOM_AR_ENFORCE: bool = False
+    # Disable pinned-host staging for multimodal H2D transfers (fall back to
+    # pageable copies). Workaround for cudaHostAlloc failures during encoder
+    # profiling under host-memory pressure or memlock limits.
+    VLLM_MM_DISABLE_PINNED_H2D: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1292,6 +1297,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CudaCommunicator on ROCm.
     "VLLM_ROCM_USE_AITER_CUSTOM_AR": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_CUSTOM_AR", "True").lower() in ("true", "1")
+    ),
+    "VLLM_CUSTOM_AR_ENFORCE": lambda: (
+        os.getenv("VLLM_CUSTOM_AR_ENFORCE", "0").lower() in ("true", "1")
+    ),
+    "VLLM_MM_DISABLE_PINNED_H2D": lambda: (
+        os.getenv("VLLM_MM_DISABLE_PINNED_H2D", "0").lower() in ("true", "1")
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops

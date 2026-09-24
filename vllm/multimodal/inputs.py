@@ -21,11 +21,15 @@ import numpy as np
 from PIL.Image import Image
 from typing_extensions import TypeVar
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.jsontree import json_iter_leaves, json_map_leaves
 
 from .media import MediaWithBytes
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     import torch
@@ -317,12 +321,26 @@ def _nested_tensors_h2d(
     if device is None:
         return tensors
 
+    # Pinned staging is a perf optimization only; cudaHostAlloc can fail
+    # (memlock limits, host-memory pressure, or a stale async CUDA error
+    # surfacing at the next API call, seen during encoder profiling at high
+    # gpu-memory-utilization). Fall back to a pageable copy instead of dying;
+    # VLLM_MM_DISABLE_PINNED_H2D=1 skips the pinned attempt entirely.
+    pin_memory = pin_memory and not envs.VLLM_MM_DISABLE_PINNED_H2D
+
     def _h2d(x: torch.Tensor) -> torch.Tensor:
         if not isinstance(x, torch.Tensor):
             return x
         if pin_memory and x.is_cpu and not (x.is_pinned() and _is_dense(x)):
             # Ensure tensor is pinned and dense for non_blocking H2D copy.
-            x = x.new_empty(x.shape, pin_memory=True).copy_(x)
+            try:
+                x = x.new_empty(x.shape, pin_memory=True).copy_(x)
+            except Exception:
+                logger.warning_once(
+                    "Pinned-host allocation for multimodal H2D transfer "
+                    "failed; falling back to a pageable copy. Set "
+                    "VLLM_MM_DISABLE_PINNED_H2D=1 to skip the pinned path."
+                )
         return x.to(device=device, non_blocking=True)
 
     return json_map_leaves(_h2d, tensors)

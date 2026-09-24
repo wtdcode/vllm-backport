@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -266,11 +268,38 @@ class MiMoV2Attention(nn.Module):
             v_head_size=self.v_head_dim,
         )
 
+        # VLLM_MIMO_OPROJ_FP8=1 quantizes the checkpoint's bf16 o_proj to
+        # FP8 at load (per-tensor W, dynamic activations). The o_proj layers
+        # are on the checkpoint's fp8 ignore list (bf16) and the decode GEMM
+        # is memory-bound, so halving the weights wins (~1.25 ms/pass bf16
+        # per the diffbot profile; +2-4% decode on sm120, Marlin W8A16 on
+        # sm86). Ported from the diffbot recipe mimo_v2.patch.
+        # Online fp8 o_proj: OPT-IN (VLLM_MIMO_OPROJ_FP8=1) because it is
+        # lossy (per-tensor fp8 weights; GSM8K parity measured: 82.7% vs
+        # 82.0% bf16, full test set) — quality-neutral but not bit-exact.
+        # Measured on sm86 TP8 MNBT 1024 (mixed bench): +7-19% decode
+        # (149 -> 176.9 TG/s @33K), +9% prefill @33K (1689 -> 1841 PP/s).
+        # W8A16 Marlin below sm89, dynamic fp8 above. At MNBT >= 2048
+        # Marlin loses to bf16 cuBLAS (-0.5..-3.8% prefill), and
+        # long-context chained-prefill probes (20-100K) are neutral to
+        # -4%: G10 pays in decode-bound/mixed serving, not prefill. When
+        # toggling, clear ~/.cache/vllm/torch_compile_cache (env is not
+        # part of the compile cache key; stale graphs crash at first
+        # prefill).
+        o_proj_quant_config = None
+        if os.environ.get("VLLM_MIMO_OPROJ_FP8", "0") == "1":
+            from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+            o_proj_quant_config = Fp8Config(
+                is_checkpoint_fp8_serialized=False, activation_scheme="dynamic"
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config if "mtp.layers" not in prefix else None,
+            quant_config=o_proj_quant_config
+            if "mtp.layers" not in prefix
+            else None,
             reduce_results=True,
             prefix=f"{prefix}.o_proj",
         )
@@ -292,6 +321,22 @@ class MiMoV2Attention(nn.Module):
         )
 
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
+
+        if sliding_window is None and cache_config is not None and (
+            cache_config.sliding_window is None
+            or cache_config.sliding_window > 0
+        ):
+            # Full-attention layer of a hybrid model. The checkpoint ships a
+            # generic hf `sliding_window` describing its SWA layers, which
+            # config resolution copies into cache_config.sliding_window (no
+            # `layer_types` array to say otherwise); Attention's model-level
+            # fallback would inherit it here and turn this layer into a
+            # windowed one — mis-pricing the KV pool (capacity ~ window /
+            # max_in_flight) and window-masking the global attention. Hand
+            # Attention a copy with the sentinel so it resolves full attention
+            # while still threading the cache dtype.
+            cache_config = copy.copy(cache_config)
+            cache_config.sliding_window = -1
 
         # Use DiffKV backend when V has a different head dim than K.
         # Auto-pick FA-DiffKV when FA3/4 is usable on this device, else fall
@@ -385,6 +430,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 rope_theta=getattr(config, "swa_rope_theta", rope_theta),
                 max_position_embeddings=max_position_embeddings,
+                cache_config=vllm_config.cache_config,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
                 prefix=f"{prefix}.self_attn",
@@ -402,6 +448,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 rope_theta=rope_theta,
                 max_position_embeddings=max_position_embeddings,
+                cache_config=vllm_config.cache_config,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
                 prefix=f"{prefix}.self_attn",
@@ -473,67 +520,121 @@ def _shard_fp8_qkv_proj(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shard the fp8 qkv_proj weights for ``tp_rank``.
 
-    The checkpoint stores the fused QKV as ``num_kv_heads`` contiguous groups
-    (one per KV head; ``n`` below), each ordered ``[Q | K | V]``:
+    Xiaomi exports the fused QKV pre-sharded for the quant-time tensor
+    parallel degree ``NB``: ``NB`` contiguous blocks where block ``i`` is
+    TP-rank ``i``'s ``[Q | K | V]`` end-to-end. Per block, Q has
+    ``(num_heads / NB) * head_dim`` rows, K has ``(num_kv_heads / NB) *
+    head_dim`` rows and V has ``(num_kv_heads / NB) * v_head_dim`` rows.
+    All known MiMo checkpoints (fp8 source, AWQ) are pre-sharded TP-4, so
+    NB=4; for full-attention layers (num_kv_heads == NB) this coincides
+    with one KV head per block, but e.g. the SWA layers (num_kv_heads=8)
+    carry two KV heads per block and must NOT be sliced per KV head.
 
-        [Q_1 | K_1 | V_1 | Q_2 | K_2 | V_2 | ... | Q_n | K_n | V_n]
+    Scale layouts (both observed in MiMo-V2.6-Flash-RL): per-block padded
+    (``NB * ceil(rows_per_block / block)`` scale rows; block rows are a
+    whole number of 128-row scale blocks for 192/128 head dims) or
+    globally packed (``ceil(total_rows / block)``). Dequantization is
+    row-wise, so both expand identically when blocks are scale-aligned.
 
-    Per group, Q has ``(num_heads / num_kv_heads) * head_dim`` rows, K has
-    ``head_dim`` rows, and V has ``v_head_dim`` rows.
-
-    Each TP rank owns ``g = num_kv_heads / tp_size`` of these groups, and the
-    forward expects them de-interleaved into a single Q, K, and V block:
-
-        [Q_1 | Q_2 | ... | Q_g | K_1 | K_2 | ... | K_g | V_1 | V_2 | ... | V_g]
-
-    When ``g == 1`` the rank's slice is already ``[Q | K | V]``, so a plain
-    chunk suffices. When ``g > 1`` we cannot reach the de-interleaved layout by
-    re-permuting the fp8 block scales: each scale covers a 128-row block, and
-    since K is 192 rows (1.5 blocks) a block straddles the K/V boundary, so no
-    whole-block permutation produces it. Instead we dequantize this rank's
-    groups to float (dropping the block constraint), reorder the rows into the
-    layout above (Q, K, and V then each span a whole number of blocks), and
-    re-quantize to fp8.
+    The serving shard concatenates the blocks' Q/K/V parts into
+    head-ordered ``all_q / all_k / all_v`` and slices for ``tp_rank``
+    (split K/V heads while ``num_kv_heads >= tp_size``, else replicate,
+    matching QKVParallelLinear's ``num_kv_head_replicas``). When
+    ``tp_size == NB`` a rank's slice is exactly one block, so weights and
+    scales shard by plain chunks without re-quantization; otherwise the
+    rank's rows are dequantized to float, reordered, and re-quantized to
+    fp8 (no block constraint survives a row permutation: K is 192 rows =
+    1.5 scale blocks).
     """
-    assert tp_size <= num_kv_heads and num_kv_heads % tp_size == 0, (
-        "TP size must evenly split the number of KV heads."
-    )
+    nb = 4  # quant-time TP the fused qkv is pre-sharded for
+    if num_heads % nb != 0 or num_kv_heads % nb != 0:
+        raise ValueError(
+            f"fused qkv is pre-sharded for TP-{nb}; num_heads={num_heads} and "
+            f"num_kv_heads={num_kv_heads} must be divisible by {nb}."
+        )
+    q_rows_per_block = (num_heads // nb) * head_dim
+    k_rows_per_block = (num_kv_heads // nb) * head_dim
+    v_rows_per_block = (num_kv_heads // nb) * v_head_dim
+    rows_per_block = q_rows_per_block + k_rows_per_block + v_rows_per_block
+    total_rows = nb * rows_per_block
+    w_cols = w_full.shape[1]
+    if w_full.shape[0] != total_rows:
+        raise ValueError(
+            f"fp8 qkv_proj weight has {w_full.shape[0]} rows; expected "
+            f"{total_rows} (NB={nb} blocks x {rows_per_block} rows)."
+        )
 
-    kv_heads_per_rank = num_kv_heads // tp_size
-    if kv_heads_per_rank == 1:
-        # One KV head per rank. The weights and scale can be trivially sharded
-        # without re-quantization.
-        w = w_full.chunk(tp_size, dim=0)[tp_rank]
-        s = s_full.chunk(tp_size, dim=0)[tp_rank]
+    # Detect the scale layout (identical when rows_per_block % block == 0).
+    per_block_scale_rows = -(-rows_per_block // block)
+    padded_scale_rows = nb * per_block_scale_rows
+    packed_scale_rows = -(-total_rows // block)
+    if s_full.shape[0] not in (padded_scale_rows, packed_scale_rows):
+        raise ValueError(
+            f"fp8 qkv_proj scale has {s_full.shape[0]} rows; expected the "
+            f"per-block padded layout ({padded_scale_rows} rows) or the "
+            f"globally packed layout ({packed_scale_rows} rows)."
+        )
+
+    if tp_size == nb:
+        # One whole pre-sharded block per rank: already [Q | K | V] for this
+        # rank and scale-aligned; plain chunks suffice (exact, no requant).
+        w = w_full.chunk(nb, dim=0)[tp_rank]
+        s = s_full.chunk(nb, dim=0)[tp_rank]
         return w, s
 
-    q_rows_per_group = (num_heads // num_kv_heads) * head_dim
-    k_rows_per_group = head_dim
-    v_rows_per_group = v_head_dim
-    rows_per_group = q_rows_per_group + k_rows_per_group + v_rows_per_group
-    scale_rows_per_group = s_full.shape[0] // num_kv_heads
-    qs, ks, vs = [], [], []
-    for g_idx in range(tp_rank * kv_heads_per_rank, (tp_rank + 1) * kv_heads_per_rank):
-        row_start = g_idx * rows_per_group
-        scale_row_start = g_idx * scale_rows_per_group
-        # Dequantize this group's weights.
-        w_g = w_full[row_start : row_start + rows_per_group].to(torch.float32)
-        s_g = s_full[scale_row_start : scale_row_start + scale_rows_per_group].to(
-            torch.float32
-        )
-        s_g_expanded = s_g.repeat_interleave(block, dim=0).repeat_interleave(
+    # Dequantize to float, row-wise over the whole tensor.
+    if s_full.shape[0] == padded_scale_rows:
+        w_deq_blocks = []
+        for b_idx in range(nb):
+            row_start = b_idx * rows_per_block
+            scale_row_start = b_idx * per_block_scale_rows
+            s_b = s_full[scale_row_start : scale_row_start + per_block_scale_rows]
+            s_b_expanded = s_b.repeat_interleave(block, dim=0).repeat_interleave(
+                block, dim=1
+            )[:rows_per_block, :w_cols]
+            w_b = w_full[row_start : row_start + rows_per_block].to(torch.float32)
+            w_deq_blocks.append(w_b * s_b_expanded.to(torch.float32))
+    else:
+        s_expanded = s_full.repeat_interleave(block, dim=0).repeat_interleave(
             block, dim=1
-        )[:rows_per_group]
-        w_g_dequant = w_g * s_g_expanded
-        # Track the dequantized q, k, and v weights separately.
-        qs.append(w_g_dequant[:q_rows_per_group])
-        ks.append(w_g_dequant[q_rows_per_group : q_rows_per_group + k_rows_per_group])
-        vs.append(w_g_dequant[q_rows_per_group + k_rows_per_group :])
+        )[:total_rows, :w_cols]
+        w_deq = w_full.to(torch.float32) * s_expanded.to(torch.float32)
+        w_deq_blocks = [
+            w_deq[b_idx * rows_per_block : (b_idx + 1) * rows_per_block]
+            for b_idx in range(nb)
+        ]
 
-    # Combine the q, k, and v weights into the following layout:
-    # [Q_1, Q_2, .., Q_g, K_1, K_2, ..., K_g, V_1, V_2, ..., V_g]
-    grouped = torch.cat([torch.cat(qs), torch.cat(ks), torch.cat(vs)], dim=0)
-    # Quantize back to fp8.
+    # Concatenate the blocks' Q/K/V parts into head-ordered full tensors.
+    all_q = torch.cat([b[:q_rows_per_block] for b in w_deq_blocks], dim=0)
+    k_end = q_rows_per_block + k_rows_per_block
+    all_k = torch.cat(
+        [b[q_rows_per_block:k_end] for b in w_deq_blocks], dim=0
+    )
+    all_v = torch.cat([b[k_end:] for b in w_deq_blocks], dim=0)
+
+    # Slice this rank's heads out of the head-ordered tensors.
+    num_heads_per_rank = num_heads // tp_size
+    q_start = tp_rank * num_heads_per_rank * head_dim
+    q = all_q[q_start : q_start + num_heads_per_rank * head_dim]
+    if num_kv_heads >= tp_size:
+        kvh = num_kv_heads // tp_size
+        k_start = tp_rank * kvh * head_dim
+        v_start = tp_rank * kvh * v_head_dim
+        k = all_k[k_start : k_start + kvh * head_dim]
+        v = all_v[v_start : v_start + kvh * v_head_dim]
+    else:
+        kv_replicas = tp_size // num_kv_heads
+        kvi = tp_rank // kv_replicas
+        k = all_k[kvi * head_dim : (kvi + 1) * head_dim]
+        v = all_v[kvi * v_head_dim : (kvi + 1) * v_head_dim]
+
+    grouped = torch.cat([q, k, v], dim=0)
+    # scaled_quantize requires whole ``block``-row groups; zero-pad the tail
+    # block (the caller truncates to the parameter size; zero rows do not
+    # perturb the real rows' block scales).
+    pad_rows = -grouped.shape[0] % block
+    if pad_rows:
+        grouped = torch.nn.functional.pad(grouped, (0, 0, 0, pad_rows))
     return scaled_quantize(
         grouped, GroupShape(block, block), w_full.dtype, compute_dtype=torch.float32
     )

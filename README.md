@@ -12,6 +12,7 @@ Status:
 | `GLM-5.3-Flash` | FP8, [AWQ W4A16](https://huggingface.co/wtdcode/GLM-5.3-Flash-AWQ-W4A16) | Fully Supported (v0.11.2+) |
 | `DeepSeek-V4-Flash-Vision-Exp` | Native FP4 | Fully Supported (v0.13.0+) |
 | `DeepSeek-V4.1-Flash` | Native FP4 with Engram | Fully Supported (v0.13.0+) |
+| `MiMo-V2.6-Flash-RL` | Native MXFP4 (fp8 QKV/o_proj) | Fully Supported (main) |
 
 Note we have a paired [LMCache](https://github.com/wtdcode/LMCache/tree/vllm-backport) fork for production kvcache serving, **which is also built into our docke images.**
 
@@ -205,3 +206,48 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
 
 - Expert parallel also works.
 - LMCache: Note that the KV block size is 128.
+
+#### MiMo-V2.6-Flash-RL
+
+```bash
+VLLM_MM_DISABLE_PINNED_H2D=1 \
+vllm serve /home/ubuntu/models/MiMo-V2.6-Flash-RL-XiaomiMiMo \
+  -tp 8 \
+  --pipeline-parallel-size 1 \
+  --trust-remote-code \
+  --generation-config vllm \
+  --reasoning-parser mimo \
+  --tool-call-parser mimo \
+  --enable-auto-tool-choice \
+  --served-model-name mimo-v2.6-flash \
+    --port 8000 \
+    --host 0.0.0.0 \
+    --uvicorn-log-level info \
+    --max-num-seqs 8 \
+    --seed 1234 \
+    --max-model-len auto \
+    -O3 \
+    --no-use-tqdm-on-load \
+    --performance-mode balanced \
+    --enable-chunked-prefill \
+    --max-num-batched-tokens 512 \
+    --enable-prefix-caching \
+    --chat-template /home/ubuntu/models/MiMo-V2.6-Flash-RL-XiaomiMiMo/chat_template_fixed.jinja \
+    --default-chat-template-kwargs '{"interleaved_thinking": true,"preserve_thinking": true}' \
+    --gpu-memory-utilization 0.94 \
+    --generation-config vllm \
+    --attention-backend TRITON_ATTN_DIFFKV \
+    --enable-prompt-tokens-details \
+    --kv-cache-dtype fp8 \
+    --skip-mm-profiling \
+    --limit-mm-per-prompt '{"audio": 0, "image": 4, "video": 0}' \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+```
+
+- Verified on 8x RTX 3090 (sm86, TP8) with MTP-3 and fp8 KV: single-stream decode ~177 t/s at 33K context (159 t/s with bf16 o_proj), prefill ~1840 tok/s at 33K prompts and ~2400 tok/s incremental on 20K chained-prefix context; 462 t/s aggregate at 16 concurrent streams; GSM8K 82.7%. The fused-fp8-QKV NB=4 sharding, MTP loader and sliding-window fixes are required for any serving of this checkpoint: TP8 previously produced garbage output (row-scrambled SWA layers), TP2/TP4 crashed at weight load.
+- `--max-num-batched-tokens 512` is the measured sweet spot on this rig for single-stream latency (+15-29% incremental prefill vs 1024 at 20-50K context; 2048+ loses). At 512 the chunked-prefill all-reduces stay under the stock 8 MiB custom-AR cutoff, so no all-reduce tuning is needed. For multi-stream throughput raise `--max-num-seqs` instead (capture sizes auto-follow).
+- `VLLM_MIMO_OPROJ_FP8=1` (opt-in): quantizes the 48 bf16 o_proj layers to online per-tensor fp8 (Marlin W8A16 on sm86) for +7-19% decode and +9% prefill at MNBT 1024; GSM8K parity measured (82.7% vs 82.0%). It is lossy (not bit-exact), hence opt-in. Clear `~/.cache/vllm/torch_compile_cache` once when toggling it, and keep the chunk budget below 2048 (Marlin W8A16 loses to bf16 cuBLAS at large chunk M).
+- fp8 KV on sm<89 works on this path: the DiffKV kernels dequantize E4M3 through a LUT (no native fp8 math) and the store path quantizes via torch; the KV pool roughly doubles (787K tokens at 0.96 / MNBT 512 vs 331K fp16).
+- The example shape (mm towers loaded — vision and audio load even at `audio: 0` — plus util 0.94) yields a ~433K-token fp8 KV pool; one live image costs ~150 MB on top. For text-only serving drop `--skip-mm-profiling` / `--limit-mm-per-prompt`, add `--language-model-only` and raise `--gpu-memory-utilization` to 0.96: the towers free ~1 GiB/card and the pool grows to ~650K+ tokens. Alternatively pin the pool size directly with `--kv-cache-memory` (the startup log prints the suggested value to fully utilize the card).
+- `VLLM_CUSTOM_AR_ENFORCE=1` (opt-in, model-independent): auto-sizes the custom-all-reduce cutoff to the largest activation all-reduce so chunked prefill stays on the custom P2P path instead of falling back to NCCL above the 8 MiB default — measured +18-46% prefill at 13-21K prompts at MNBT 1024. Only relevant at chunk budgets >= 1024; unset keeps upstream behavior byte-for-byte.
+- The `chat_template_fixed.jinja` patch adds `reasoning_content` round-trip and pre-opened thinking; `chat_utils` now also accepts `reasoning_content` on input for any model when `reasoning` is absent.

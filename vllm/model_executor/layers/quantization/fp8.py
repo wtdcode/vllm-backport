@@ -91,6 +91,25 @@ if TYPE_CHECKING:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = init_logger(__name__)
+def _dense_marlin_input_dtype(prefix: str | None) -> torch.dtype | None:
+    """Activation dtype for DENSE fp8 Marlin layers (weight-only fallback).
+
+    Dense Marlin (the fp8-dense path on parts without native fp8) only
+    supports bf16 activations: ``prepare_fp8_layer_for_marlin`` rejects any
+    1-byte activation dtype ("Marlin W8A8 is not supported"). Activation
+    quantization via VLLM_MARLIN_INPUT_DTYPE applies to the Marlin MoE path
+    (W4A8); ignore it here so e.g. int8 on sm86 boots with dense layers at
+    W8A16 instead of crashing at load.
+    """
+    dt = get_marlin_input_dtype(prefix)
+    if dt is not None and dt.itemsize == 1:
+        logger.warning_once(
+            "VLLM_MARLIN_INPUT_DTYPE=%s applies only to the Marlin MoE path; "
+            "dense fp8 layers run weight-only (W8A16) Marlin.",
+            envs.VLLM_MARLIN_INPUT_DTYPE,
+        )
+        return None
+    return dt
 
 
 class Fp8Config(QuantizationConfig):
@@ -193,11 +212,15 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 online_method = Fp8PerTensorOnlineLinearMethod()
-                online_method.marlin_input_dtype = get_marlin_input_dtype(prefix)
+                online_method.marlin_input_dtype = _dense_marlin_input_dtype(
+                    prefix
+                )
                 return online_method
             else:
                 offline_method = Fp8LinearMethod(self)
-                offline_method.marlin_input_dtype = get_marlin_input_dtype(prefix)
+                offline_method.marlin_input_dtype = _dense_marlin_input_dtype(
+                    prefix
+                )
                 return offline_method
         elif isinstance(layer, RoutedExperts):
             if is_layer_skipped(

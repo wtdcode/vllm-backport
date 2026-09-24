@@ -579,11 +579,28 @@ def triton_reshape_and_cache_flash_diffkv(
         else kv_cache.dtype
     )
 
-    if kv_cache.dtype != kv_cache_torch_dtype and is_quantized_kv_cache(kv_cache_dtype):
-        # to avoid erounous implicit cast in triton kernel (tl.store to uint8)
-        # (e.g. explicit cast to fp8e4m3fnuz is not supported in triton 3.4)
-        kv_cache = kv_cache.view(kv_cache_torch_dtype)
-    FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
+    if is_quantized_kv_cache(kv_cache_dtype) and not (
+        current_platform.has_device_capability(89)
+    ):
+        # sm<89: Triton cannot lower fp8e4nv casts at all (compile-time type
+        # error), so the implicit-cast store below is unusable. Quantize
+        # through torch's software cast instead and move raw bytes: the
+        # kernel sees uint8 in / uint8 out, no fp8 types anywhere. Scales are
+        # applied here with the same per-tensor convention as the sm89+ path,
+        # and the read side's LUT dequant applies the matching descales.
+        key = (key / k_scale).to(kv_cache_torch_dtype).view(torch.uint8)
+        value = (value / v_scale).to(kv_cache_torch_dtype).view(torch.uint8)
+        # kv_cache stays uint8 (its allocated storage dtype); the kernel
+        # stores bytes verbatim.
+        FP8_KV_CACHE = False
+    else:
+        if kv_cache.dtype != kv_cache_torch_dtype and is_quantized_kv_cache(
+            kv_cache_dtype
+        ):
+            # to avoid erounous implicit cast in triton kernel (tl.store to uint8)
+            # (e.g. explicit cast to fp8e4m3fnuz is not supported in triton 3.4)
+            kv_cache = kv_cache.view(kv_cache_torch_dtype)
+        FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
     # heuristics instead of autotuning
     TILE_SIZE = max(head_size_k, head_size_v)
     TILE_SIZE = triton.next_power_of_2(TILE_SIZE)

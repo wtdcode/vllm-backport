@@ -2011,6 +2011,11 @@ def _parse_chat_message_content(
     role = message["role"]
     content = message.get("content")
     reasoning = message.get("reasoning")
+    if reasoning is None:
+        # Clients such as Hermes echo earlier reasoning under
+        # `reasoning_content`; accept it so multi-turn reasoning is not
+        # silently dropped (the output side already emits both names).
+        reasoning = message.get("reasoning_content")
 
     if content is None:
         content = []

@@ -264,8 +264,13 @@ class Attention(nn.Module, AttentionLayerBase):
             # per-layer sliding window
             sliding_window = per_layer_sliding_window
         elif cache_config is not None:
-            # model-level sliding window
+            # Model-level sliding window. "-1" (or None) is the "no global
+            # window" sentinel — hybrid models with per-layer windows leave
+            # it unset, and such layers must resolve to full attention, not
+            # to a nonsensical window of -1.
             sliding_window = cache_config.sliding_window
+            if sliding_window is None or sliding_window <= 0:
+                sliding_window = None
         else:
             sliding_window = None
 
