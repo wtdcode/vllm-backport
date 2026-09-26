@@ -1328,6 +1328,43 @@ def test_project_kv_cache_groups_to_worker():
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
 
 
+def test_pp_worker_config_skips_uniform_group_owned_by_other_stage():
+    # A UniformTypeKVCacheSpecs group whose layers all live on another PP
+    # stage projects to an empty group that keeps the global spec. The worker
+    # must not allocate KV tensors for the other stage's layers.
+    model_config = ModelConfig(max_model_len=512)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+    vllm_config.cache_config.prefix_cache_retention_interval = None
+    spec_a = new_kv_cache_spec()
+    spec_b = new_kv_cache_spec(num_kv_heads=4)
+    global_groups = [
+        KVCacheGroupSpec(
+            ["stage0.a", "stage0.b"],
+            UniformTypeKVCacheSpecs(
+                block_size=16, kv_cache_specs={"stage0.a": spec_a, "stage0.b": spec_b}
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["stage1.c", "stage1.d"],
+            UniformTypeKVCacheSpecs(
+                block_size=16, kv_cache_specs={"stage1.c": spec_a, "stage1.d": spec_b}
+            ),
+        ),
+    ]
+    stage1_spec = {"stage1.c": spec_a, "stage1.d": spec_b}
+    projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+        global_groups, stage1_spec
+    )
+    assert projected[0].layer_names == []
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, projected, 1 << 30
+    )
+    allocated = {name for tensor in config.kv_cache_tensors for name in tensor.layers}
+    assert allocated == set(stage1_spec)
+
+
 def test_dcp_world_size_for_kv_cache_spec_shards_full_attention_only():
     dcp = 8
     full = FullAttentionSpec(
