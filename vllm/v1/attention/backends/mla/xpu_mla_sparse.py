@@ -11,6 +11,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
+    MLACommonPrefillMetadata,
     get_mla_dims,
 )
 from vllm.utils.torch_utils import is_quantized_kv_cache, np_to_pinned_tensor
@@ -104,6 +105,10 @@ class XPUMLASparseMetadata(AttentionMetadata):
     num_decodes: int = 0
     num_prefills: int = 0
     num_decode_tokens: int = 0
+    # `_use_sparse_mha` (the dense/masked-MHA prefill dispatch) reads these
+    # unconditionally as well; None keeps every token on the sparse MQA path.
+    prefill: MLACommonPrefillMetadata | None = None
+    prefill_max_seq_len: int = 0
 
 
 @dataclass
