@@ -1071,6 +1071,28 @@ def get_max_concurrency_for_kv_cache_config(
         for group in kv_cache_config.kv_cache_groups
     )
     max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
+
+    in_flight = vllm_config.max_in_flight_tokens
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
+        sliding_window = getattr(spec, "sliding_window", None)
+        if sliding_window is not None and in_flight > 4 * sliding_window:
+            logger.warning_once(
+                "Sliding-window group (%s layers, window %d) reserves %d "
+                "in-flight tokens per request - %.1fx the window itself "
+                "(max_concurrent_batches x max_num_batched_tokens). The "
+                "resulting KV capacity is pipeline-depth-bound, not "
+                "window-bound. To enlarge the pool, lower "
+                "--max-num-batched-tokens (chunks recycle faster) or reduce "
+                "pipeline parallelism.",
+                len(group.layer_names),
+                sliding_window,
+                in_flight,
+                in_flight / sliding_window,
+            )
+            break
     return max_concurrency
 
 
