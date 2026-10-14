@@ -30,7 +30,7 @@ nvidia-cutlass-dsl[cu13]==4.6.2
 quack-kernels==0.6.4  # Required for CUTLASS DSL 4.6 by MSA
 
 # Tokenspeed_MLA for faster mla with spec decode
-tokenspeed-mla==0.1.8; platform_system == "Linux"
+tokenspeed-mla==2.0.0; platform_system == "Linux"
 
 # Humming kernels for quantization gemm
 humming-kernels[cu13]==0.1.12
