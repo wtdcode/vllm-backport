@@ -30,10 +30,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -380,7 +382,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class Qwen4ExpModel(nn.Module):
+class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -458,6 +460,27 @@ class Qwen4ExpModel(nn.Module):
         else:
             self._mtp_hidden_buffer = None
 
+    def _capture_aux_hidden_state(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        block_output: torch.Tensor | None,
+        injection: torch.Tensor | None,
+    ) -> torch.Tensor:
+        # Drafters (DFlash) are trained on the completed output of a layer,
+        # averaged over the hyper-connection streams. The pending combine for
+        # layer `layer_idx - 1` is materialized the same way the next layer's
+        # body, and the PP/deepstack paths above, materialize it.
+        if block_output is not None:
+            producer = self.layers[layer_idx - 1]
+            hidden_states = producer.mlp_hyper_connection.combine(
+                hidden_states, block_output, injection
+            )
+        streams = hidden_states.unflatten(
+            -1, (self.config.hc_count, self.config.hidden_size)
+        )
+        return streams.mean(dim=-2)
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -508,6 +531,7 @@ class Qwen4ExpModel(nn.Module):
         block_output = None
         injection = None
         last_layer = None
+        aux_hidden_states: list[torch.Tensor] = []
         if self.start_layer < self.end_layer:
             self._start_layer_ple_prefetch(
                 self.layers[self.start_layer],
@@ -520,6 +544,12 @@ class Qwen4ExpModel(nn.Module):
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
             last_layer = layer
+            if layer_idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(
+                    self._capture_aux_hidden_state(
+                        layer_idx, hidden_states, block_output, injection
+                    )
+                )
             if layer_idx + 1 < self.end_layer:
                 self._start_layer_ple_prefetch(
                     self.layers[layer_idx + 1],
@@ -583,6 +613,8 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if aux_hidden_states:
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -635,6 +667,7 @@ class Qwen4ExpForCausalLM(
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsEagle3,
     Qwen4ExpMixtureOfExperts,
     IsHybrid,
 ):
@@ -871,6 +904,7 @@ class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
 class Qwen4ExpForConditionalGeneration(
     Qwen3_5ForConditionalGeneration,
     HasInnerState,
+    SupportsEagle3,
     Qwen4ExpMixtureOfExperts,
 ):
     """Qwen3-VL vision tower backed by the Qwen4Exp language model."""
