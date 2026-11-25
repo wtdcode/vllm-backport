@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
+
 import torch.nn as nn
 
 from vllm.config import ModelConfig, VllmConfig, replace
@@ -38,7 +40,8 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     from vllm.compilation.backends import set_model_tag
     from vllm.model_executor.model_loader import get_model
     from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
-    from vllm.model_executor.models.utils import get_draft_quant_config
+    from vllm.model_executor.models.utils import PPMissingLayer, get_draft_quant_config
+    from vllm.platforms import current_platform
     from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
         _should_share,
         get_target_lm_head,
@@ -78,29 +81,54 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     # config is retained for DSpark's target-layer metadata, so we must override it.
     draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
 
-    with set_model_tag("dspark_head"):
-        draft_model = get_model(
-            vllm_config=draft_vllm_config, model_config=draft_model_config
-        )
-
     target_language_model = (
         target_model.get_language_model()
         if hasattr(target_model, "get_language_model")
         else target_model
     )
     target_inner = target_language_model.model
-    draft_inner = draft_model.model
     target_vocab_size = vllm_config.model_config.get_vocab_size()
-
-    if draft_model_config.get_vocab_size() <= target_vocab_size:
-        maybe_share_target_embed(draft_model, draft_inner, target_inner)
-
     target_lm_head = get_target_lm_head(target_model, target_language_model)
-    draft_lm_head = getattr(draft_model, "lm_head", None)
     draft_output_vocab_size = (
         getattr(draft_model_config.hf_config, "draft_vocab_size", None)
         or draft_model_config.get_vocab_size()
     )
+    target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
+        target_inner, "embedding", None
+    )
+    # V4.1's CUDA drafter has no checkpoint weights for these modules. Avoid
+    # allocating throwaway copies, but attach the shared modules only after
+    # loading so draft post-processing cannot touch the target's weights.
+    defer_shared_vocab = (
+        current_platform.is_cuda()
+        and draft_model_config.architectures == ["DSparkV41DraftModel"]
+        and vllm_config.parallel_config.pipeline_parallel_size == 1
+        and draft_vllm_config.parallel_config.tensor_parallel_size
+        == vllm_config.parallel_config.tensor_parallel_size
+        and draft_model_config.get_vocab_size() == target_vocab_size
+        and draft_output_vocab_size == target_vocab_size
+        and target_embed is not None
+        and not isinstance(target_embed, PPMissingLayer)
+        and target_lm_head is not None
+        and not isinstance(target_lm_head, PPMissingLayer)
+    )
+    vocab_context = nullcontext()
+    if defer_shared_vocab:
+        from vllm.models.deepseek_v4_1.nvidia.dspark import skip_shared_vocab_alloc
+
+        vocab_context = skip_shared_vocab_alloc()
+        logger.info("DSpark V4.1: deferring shared embedding and LM head allocation")
+
+    with set_model_tag("dspark_head"), vocab_context:
+        draft_model = get_model(
+            vllm_config=draft_vllm_config, model_config=draft_model_config
+        )
+
+    draft_inner = draft_model.model
+    if draft_model_config.get_vocab_size() <= target_vocab_size:
+        maybe_share_target_embed(draft_model, draft_inner, target_inner)
+
+    draft_lm_head = getattr(draft_model, "lm_head", None)
     if (
         target_lm_head is not None
         and draft_output_vocab_size == target_vocab_size
@@ -110,4 +138,8 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             del draft_model.lm_head
         draft_model.lm_head = target_lm_head
 
+    if defer_shared_vocab and (
+        draft_inner.embed_tokens is None or draft_model.lm_head is not target_lm_head
+    ):
+        raise RuntimeError("DSpark V4.1 failed to attach shared vocabulary modules")
     return draft_model
