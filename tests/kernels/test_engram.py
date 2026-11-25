@@ -529,9 +529,10 @@ def _reference_lookup(weight, scale_inv, ids, start, end, block=32):
     return values.masked_fill(mask.unsqueeze(-1), 0)
 
 
-def _make_embedding(cpu_offload, rows=4096, dim=256, block=32):
+def _make_embedding(cpu_offload, rows=4096, dim=256, block=32, packed_fp4=False):
     layer = ParallelEngramEmbedding.__new__(ParallelEngramEmbedding)
     torch.nn.Module.__init__(layer)
+    layer.packed_fp4 = packed_fp4
     layer.dim, layer.block_size, layer.tp_size = dim, block, 1
     layer.n_hash_cols = layer.part_n_hash_cols = 24
     layer.head_start = 0
@@ -547,12 +548,17 @@ def _make_embedding(cpu_offload, rows=4096, dim=256, block=32):
         {"device": "cpu", "pin_memory": True} if cpu_offload else {"device": "cuda"}
     )
     owned = layer.vocab_end_idx - layer.vocab_start_idx
-    layer.weight = torch.empty(owned, dim, dtype=torch.float8_e4m3fn, **kwargs)
+    weight_dtype = torch.uint8 if packed_fp4 else torch.float8_e4m3fn
+    row_bytes = dim // 2 if packed_fp4 else dim
+    layer.weight = torch.empty(owned, row_bytes, dtype=weight_dtype, **kwargs)
     layer.weight_scale_inv = torch.empty(
         owned, dim // block, dtype=torch.uint8, **kwargs
     )
     torch.manual_seed(0)
-    layer.weight.copy_((torch.randn(owned, dim) * 4).to(torch.float8_e4m3fn))
+    if packed_fp4:
+        layer.weight.copy_(torch.randint(0, 256, (owned, row_bytes), dtype=torch.uint8))
+    else:
+        layer.weight.copy_((torch.randn(owned, dim) * 4).to(torch.float8_e4m3fn))
     layer.weight_scale_inv.copy_(
         torch.randint(120, 134, (owned, dim // block), dtype=torch.uint8)
     )
@@ -640,15 +646,22 @@ def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeyp
 @pytest.mark.parametrize("cpu_offload", [False, True])
 @pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 7, 256])
-def test_engram_lookup_matches_torch(cpu_offload, background, num_tokens):
-    """The fused gather must be bit-exact with the torch dequant path it
-    replaces, from HBM and from pinned host memory alike, and must contribute
-    zeros for rows another TP rank owns."""
-    layer = _make_embedding(cpu_offload)
+@pytest.mark.parametrize("packed_fp4", [False, True])
+def test_engram_lookup_matches_torch(cpu_offload, background, num_tokens, packed_fp4):
+    """Compare FP8 and MXFP4 lookup, including unowned rows, to a torch reference."""
+    layer = _make_embedding(cpu_offload, packed_fp4=packed_fp4)
     cols, rows = 24, layer.part_num_embeddings
     ids = torch.randint(0, rows, (num_tokens, cols), dtype=torch.int32, device="cuda")
+    weight = layer.weight.cuda()
+    if packed_fp4:
+        codes = torch.stack((weight & 15, weight >> 4), dim=-1).flatten(-2).long()
+        values = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            device=weight.device,
+        )
+        weight = values[codes]
     expected = _reference_lookup(
-        layer.weight.cuda(),
+        weight,
         layer.weight_scale_inv.cuda(),
         ids,
         layer.vocab_start_idx,
