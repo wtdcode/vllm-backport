@@ -214,7 +214,15 @@ class DeepseekV4FP8Config(Fp8Config):
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
-                if self.moe_quant_algo == "NVFP4":
+                from vllm.compilation import backends
+
+                # V4.1 DSpark's mtp.* experts use the native MXFP4 format
+                # even when the containing checkpoint exports the target
+                # experts as NVFP4. The loader scopes this tag to the draft.
+                if (
+                    self.moe_quant_algo == "NVFP4"
+                    and backends.model_tag != "dspark_head"
+                ):
                     from vllm.model_executor.layers.quantization.modelopt import (
                         ModelOptNvFp4FusedMoE,
                     )

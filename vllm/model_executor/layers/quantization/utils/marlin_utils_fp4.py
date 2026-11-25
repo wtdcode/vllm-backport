@@ -48,13 +48,36 @@ def _nvfp4_compute_scale_factor(
     if a_dtype is not None and a_dtype == torch.half:
         return 1.0
 
-    ws_float = marlin_scales.float() * (2**7)
-    nonzero_mask = ws_float > 0
-    if nonzero_mask.any():
-        max_val = ws_float[nonzero_mask].max()
-        if max_val < 448 * (2**7):
-            sf = (448 * (2**7) / max_val).log2().floor().exp2()
-            return sf.item()
+    if marlin_scales.numel() == 0:
+        return 1.0
+
+    def bounded_positive_max(scales: torch.Tensor) -> torch.Tensor:
+        # Use views so non-contiguous input doesn't trigger a full-size copy.
+        if scales.numel() <= 2**20:
+            values = scales.float()
+            return torch.where(values > 0, values, 0.0).amax()
+        dim = max(range(scales.ndim), key=scales.size)
+        mid = scales.size(dim) // 2
+        return torch.maximum(
+            bounded_positive_max(scales.narrow(dim, 0, mid)),
+            bounded_positive_max(scales.narrow(dim, mid, scales.size(dim) - mid)),
+        )
+
+    # A reduction before the FP32 conversion avoids a full-sized FP32 copy,
+    # boolean mask, and advanced-indexing temporary for the usual scale types.
+    if marlin_scales.dtype in (torch.float16, torch.bfloat16, torch.float32):
+        max_scale = marlin_scales.amax().float()
+        if max_scale.isnan().item():
+            # The old positive mask discarded NaNs; preserve that behavior.
+            max_scale = bounded_positive_max(marlin_scales)
+    else:
+        # Some types (e.g. FP8) don't implement amax on every backend.
+        max_scale = bounded_positive_max(marlin_scales)
+
+    max_val = max_scale * (2**7)
+    if 0 < max_val.item() < 448 * (2**7):
+        sf = (448 * (2**7) / max_val).log2().floor().exp2()
+        return sf.item()
     return 1.0
 
 
@@ -309,10 +332,14 @@ def _repack_marlin_experts(
     size_n: int,
     size_k: int,
     is_a_8bit: bool,
+    *,
+    reuse_storage: bool = False,
 ) -> torch.Tensor:
     """Repack each expert to marlin format into a preallocated output."""
     num_experts = weight.shape[0]
     out: torch.Tensor | None = None
+    if reuse_storage:
+        assert weight.is_contiguous() and weight.storage_offset() == 0
     for i in range(num_experts):
         qweight = weight[i].view(torch.int32).T.contiguous()
         marlin_qweight = ops.gptq_marlin_repack(
@@ -322,13 +349,20 @@ def _repack_marlin_experts(
             num_bits=4,
             is_a_8bit=is_a_8bit,
         )
+        if out is None and reuse_storage:
+            out = weight.view(marlin_qweight.dtype).view(
+                num_experts, *marlin_qweight.shape
+            )
         if out is None:
             out = torch.empty(
                 (num_experts, *marlin_qweight.shape),
                 dtype=marlin_qweight.dtype,
                 device=marlin_qweight.device,
             )
-        out[i] = marlin_qweight
+        # The repack reads qweight and produces a separate tensor before
+        # we write back this expert. Other experts remain untouched.
+        out[i].copy_(marlin_qweight)
+        del qweight, marlin_qweight
     assert out is not None
     return out
 
@@ -422,7 +456,7 @@ def prepare_nvfp4_moe_layer_for_marlin(
     ) -> tuple[torch.Tensor, torch.Tensor]:
         scales = scales.to(param_dtype)
 
-        tensor_list = []
+        out = None
         if "w13" in name:
             scales = pad_w13(scales)
             size_n, size_k = padded_N * num_shards, K
@@ -446,12 +480,19 @@ def prepare_nvfp4_moe_layer_for_marlin(
             marlin_scales, _ = nvfp4_marlin_process_scales(
                 marlin_scales, scale_factor=combined_scale_factor, a_dtype=param_dtype
             )
-            tensor_list.append(marlin_scales)
+            if out is None:
+                out = torch.empty(
+                    (E, *marlin_scales.shape),
+                    dtype=marlin_scales.dtype,
+                    device=marlin_scales.device,
+                )
+            out[i].copy_(marlin_scales)
+            del marlin_scales
 
-        scales = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+        assert out is not None
         g_scales = nvfp4_marlin_process_global_scale(g_scales, param_dtype)
         g_scales = g_scales / combined_scale_factor
-        return scales, g_scales
+        return out, g_scales
 
     w13_scale, w13_scale_2 = permute_scales(w13_scale, w13_scale_2, "w13")
     w2_scale, w2_scale_2 = permute_scales(w2_scale, w2_scale_2, "w2")
@@ -594,7 +635,7 @@ def prepare_moe_mxfp4_layer_for_marlin(
     """Pure-function version of prepare_moe_fp4_layer_for_marlin for MXFP4.
 
     Takes weight tensors as inputs and returns transformed tensors.
-    Does NOT modify the layer in-place.
+    The CUDA DSpark load may reuse packed weight and scale storage.
     """
     input_dtype = get_marlin_input_dtype()
     if (
@@ -604,6 +645,19 @@ def prepare_moe_mxfp4_layer_for_marlin(
     ):
         raise RuntimeError("MXFP4 weight + INT8 activation is not supported.")
 
+    from vllm.compilation import backends
+
+    # This is destructive and only valid for freshly loaded, GPU-resident
+    # DSpark tensors. Leave the regular and CPU-offloaded paths unchanged.
+    reuse_storage = backends.model_tag == "dspark_head" and all(
+        p is not None
+        and p.is_cuda
+        and p.is_contiguous()
+        and p.storage_offset() == 0
+        and p.dtype == torch.uint8
+        and not getattr(p, "_vllm_is_uva_offloaded", False)
+        for p in (w13, w2, w13_scale, w2_scale)
+    )
     group_size = 32  # MXFP4 block size
 
     # Derive dimensions from actual weight shapes to handle rounded/padded
@@ -625,7 +679,9 @@ def prepare_moe_mxfp4_layer_for_marlin(
 
         assert weight.shape == (e, size_n, size_k // 2)
 
-        return _repack_marlin_experts(weight, size_n, size_k, is_a_8bit)
+        return _repack_marlin_experts(
+            weight, size_n, size_k, is_a_8bit, reuse_storage=reuse_storage
+        )
 
     w13 = repack_weight(w13, "w13")
     w2 = repack_weight(w2, "w2")
@@ -633,16 +689,18 @@ def prepare_moe_mxfp4_layer_for_marlin(
     # WEIGHT SCALES: Permute scales
     def permute_scales(scales: torch.Tensor, name: str) -> torch.Tensor:
         scales = scales.view(torch.float8_e8m0fnu)
-        scales = scales.to(param_dtype)
+        if not reuse_storage:
+            scales = scales.to(param_dtype)
 
         tensor_list = []
+        out = None
         if "w13" in name:
             size_n, size_k = n * 2, k
         else:
             size_n, size_k = k, n
 
         for i in range(e):
-            scale = scales[i].T
+            scale = scales[i].to(param_dtype).T
             marlin_scales = marlin_permute_scales(
                 s=scale,
                 size_k=size_k,
@@ -653,7 +711,14 @@ def prepare_moe_mxfp4_layer_for_marlin(
             marlin_scales = mxfp4_marlin_process_scales(
                 marlin_scales, input_dtype=input_dtype
             )
-            tensor_list.append(marlin_scales)
+            if reuse_storage:
+                if out is None:
+                    out = scales.view(e, *marlin_scales.shape)
+                out[i].view(torch.uint8).copy_(marlin_scales.view(torch.uint8))
+            else:
+                tensor_list.append(marlin_scales)
+        if out is not None:
+            return out
         return torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
 
     w13_scale = permute_scales(w13_scale, "w13")

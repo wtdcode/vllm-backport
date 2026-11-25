@@ -186,6 +186,21 @@ class EngramLayout:
         self.pad_token_id: int = config.engram_pad_token_id
         assert len(self.layer_ids) == len(self.num_embeddings)
 
+        # Match the checkpoint layout before allocating the embedding tables.
+        quant = getattr(config, "quantization_config", None) or {}
+        embed_quant = quant.get("engram_embed_quant", "fp8")
+        if embed_quant not in ("fp8", "mxfp4"):
+            raise ValueError(f"Unsupported engram_embed_quant {embed_quant!r}")
+        for key, expected in (
+            ("engram_embed_block_size", 32),
+            ("engram_embed_scale_dtype", "ue8m0"),
+        ):
+            if quant.get(key, expected) != expected:
+                raise ValueError(f"{key} must be {expected!r}")
+        if set(quant.get("engram_embed_layers", self.layer_ids)) != set(self.layer_ids):
+            raise ValueError("engram_embed_layers must match engram_layer_ids")
+        self.packed_fp4 = embed_quant == "mxfp4"
+
         primes = []
         seen: set[int] = set()
         for _ in self.layer_ids:
@@ -580,8 +595,9 @@ def _engram_lookup_kernel(
     QUANT_BLOCK: tl.constexpr,
     BLOCK_R: tl.constexpr,
     GRID: tl.constexpr,
+    PACKED_FP4: tl.constexpr,
 ):
-    """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
+    """Gather FP8 or packed MXFP4 rows, apply UE8M0 scales, write BF16.
 
     Only this rank's heads are read; padded heads write zeros for all-gather.
     `weight`/`scales` may address pinned host memory through UVA. `weight` is
@@ -602,12 +618,28 @@ def _engram_lookup_kernel(
         owned = valid & (head < TOTAL_HEADS)
         owned &= (index >= vocab_start) & (index < vocab_end)
         local = tl.where(owned, index - vocab_start, 0)
-        values = tl.load(
-            weight + local[:, None] * DIM + cols[None, :],
-            mask=owned[:, None],
-            other=0,
-        )
-        values = _decode_fp8_f32(values, False)
+        if PACKED_FP4:
+            # E2M1: even columns use the low nibble, odd columns the high.
+            byte = tl.load(
+                weight + local[:, None] * (DIM // 2) + (cols // 2)[None, :],
+                mask=owned[:, None],
+                other=0,
+            ).to(tl.int32)
+            nibble = (byte >> (4 * (cols[None, :] % 2))) & 0xF
+            exponent = (nibble >> 1) & 3
+            mantissa = (nibble & 1).to(tl.float32)
+            pow2 = ((exponent + 125) << 23).to(tl.float32, bitcast=True)
+            magnitude = tl.where(
+                exponent == 0, mantissa * 0.5, (2 + mantissa) * pow2
+            )
+            values = tl.where((nibble & 8) != 0, -magnitude, magnitude)
+        else:
+            values = tl.load(
+                weight + local[:, None] * DIM + cols[None, :],
+                mask=owned[:, None],
+                other=0,
+            )
+            values = _decode_fp8_f32(values, False)
         scale = tl.load(
             scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
             mask=owned[:, None],
@@ -624,11 +656,13 @@ def _engram_lookup_kernel(
 
 class ParallelEngramEmbedding(nn.Module):
     """The n-gram hash table, sharded by complete hash heads over TP ranks.
-    Rows stay fp8 and are dequantized with ue8m0 per-32 scales on lookup.
+    Rows stay FP8 or packed MXFP4 and use UE8M0 per-32 scales on lookup.
 
     With `cpu_offload` the shard lives in pinned host memory and is read over
     UVA instead of HBM; the TP sharding is unchanged either way.
     """
+
+    packed_fp4: bool = False
 
     def __init__(
         self,
@@ -637,6 +671,8 @@ class ParallelEngramEmbedding(nn.Module):
         head_sizes: tuple[int, ...],
         block_size: int = 32,
         cpu_offload: bool = False,
+        *,
+        packed_fp4: bool = False,
     ):
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
@@ -648,6 +684,11 @@ class ParallelEngramEmbedding(nn.Module):
         self.num_embeddings = num_embeddings
         self.dim = dim
         self.block_size = block_size
+        if packed_fp4 and (block_size != 32 or dim % block_size != 0):
+            raise ValueError("MXFP4 Engram requires complete 32-value blocks")
+        self.packed_fp4 = packed_fp4
+        row_bytes = dim // 2 if packed_fp4 else dim
+        weight_dtype = torch.uint8 if packed_fp4 else torch.float8_e4m3fn
         self.n_hash_cols = len(head_sizes)
         self.part_n_hash_cols = triton.cdiv(self.n_hash_cols, tp_size)
         self.head_start = tp_rank * self.part_n_hash_cols
@@ -668,7 +709,7 @@ class ParallelEngramEmbedding(nn.Module):
         kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
         self.weight = nn.Parameter(
             torch.empty(
-                self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
+                self.part_num_embeddings, row_bytes, dtype=weight_dtype, **kwargs
             ),
             requires_grad=False,
         )
@@ -695,7 +736,7 @@ class ParallelEngramEmbedding(nn.Module):
                 "%.2f GiB per rank",
                 self.part_num_embeddings,
                 dim,
-                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+                self.part_num_embeddings * (row_bytes + dim // block_size) / 1024**3,
             )
 
     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -748,6 +789,7 @@ class ParallelEngramEmbedding(nn.Module):
             QUANT_BLOCK=self.block_size,
             BLOCK_R=16,
             GRID=grid,
+            PACKED_FP4=self.packed_fp4,
         )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
@@ -915,6 +957,7 @@ class Engram(nn.Module):
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
             cpu_offload=engram_config.cpu_offload if engram_config else True,
+            packed_fp4=layout.packed_fp4,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(

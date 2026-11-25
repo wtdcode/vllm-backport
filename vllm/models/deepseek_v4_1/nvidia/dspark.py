@@ -10,7 +10,9 @@ To implement non-causal attention, we leverage the sparse attention implementati
 include the future query tokens in the top-k indices for each query token.
 """
 
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import regex as re
 import torch
@@ -65,6 +67,19 @@ logger = init_logger(__name__)
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
+_skip_shared_vocab_alloc = ContextVar("dspark_v41_skip_shared_vocab_alloc", default=False)
+
+
+@contextmanager
+def skip_shared_vocab_alloc() -> Generator[None, None, None]:
+    """Defer shared vocabulary modules until the draft load is finished."""
+    token = _skip_shared_vocab_alloc.set(True)
+    try:
+        yield
+    finally:
+        _skip_shared_vocab_alloc.reset(token)
+
+
 class DSparkDeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -86,11 +101,14 @@ class DSparkDeepseekV4Model(nn.Module):
         )
 
         # Shared with the target (aliased by the speculator's loading utility).
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=maybe_prefix(prefix, "embed_tokens"),
-        )
+        if _skip_shared_vocab_alloc.get():
+            self.embed_tokens = None
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
+            )
 
         self.main_proj = ReplicatedLinear(
             config.hidden_size * len(self.target_layer_ids),
@@ -320,11 +338,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         # Shared with the target (aliased by the speculator's load utility).
-        self.lm_head = ParallelLMHead(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
+        if _skip_shared_vocab_alloc.get():
+            self.lm_head = None
+        else:
+            self.lm_head = ParallelLMHead(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
     # --- Hooks used by the speculator -------------------------------------
