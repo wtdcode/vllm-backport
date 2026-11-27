@@ -340,7 +340,7 @@ class HYV4MLAAttention(nn.Module):
         # Do not silently degrade sparse layers into dense attention. Probe the
         # sparse MLA backend directly and fail fast with the real error.
         kv_cache_dtype = cache_config.cache_dtype if cache_config else "auto"
-        if self.is_sparse:
+        if self.is_sparse and self._ampere_sparse_backend(kv_cache_dtype) is None:
             try:
                 get_attn_backend(
                     head_size=self.kv_lora_rank + self.qk_rope_head_dim,
@@ -545,6 +545,23 @@ class HYV4MLAAttention(nn.Module):
     def topk_indices_buffer(self, buffer: torch.Tensor) -> None:
         self.mla_attn.impl.topk_indices_buffer = buffer  # type: ignore[attr-defined]
 
+    def _ampere_sparse_backend(
+        self, kv_cache_dtype: str
+    ) -> type[AttentionBackend] | None:
+        """Return the SM8x sparse backend, which applies sinks in Triton.
+
+        FlashMLA needs SM90+, and the selector lists no SM8x backend for
+        fp8_ds_mla.
+        """
+        capability = current_platform.get_device_capability()
+        if not self.is_sparse or capability is None or capability.major != 8:
+            return None
+        from vllm.models.hy_v4.ampere.sparse_mla import HYV4AmpereMLASparseBackend
+
+        if kv_cache_dtype in HYV4AmpereMLASparseBackend.supported_kv_cache_dtypes:
+            return HYV4AmpereMLASparseBackend
+        return None
+
     def _resolve_sink_backend(
         self, kv_cache_dtype: str
     ) -> type[AttentionBackend] | None:
@@ -572,6 +589,7 @@ class HYV4MLAAttention(nn.Module):
         """
         head_size = self.kv_lora_rank + self.qk_rope_head_dim
         dtype = torch.get_default_dtype()
+        ampere_cls = self._ampere_sparse_backend(kv_cache_dtype)
         try:
             selected_cls = get_attn_backend(
                 head_size=head_size,
@@ -582,6 +600,9 @@ class HYV4MLAAttention(nn.Module):
                 num_heads=self.num_local_heads,
             )
         except Exception as exc:
+            if ampere_cls is not None:
+                # The selector lists no SM8x backend for fp8_ds_mla.
+                return ampere_cls
             # Stringify before logging: warning_once dedupes on the arguments,
             # and a fresh exception object per layer would defeat it.
             logger.warning_once(
@@ -595,20 +616,14 @@ class HYV4MLAAttention(nn.Module):
         if selected_cls.supports_sink():
             return selected_cls
 
-        capability = current_platform.get_device_capability()
-        if self.is_sparse and capability is not None and capability.major == 8:
-            # FlashMLA needs SM90+; SM8x applies sinks in the Triton kernels.
-            from vllm.models.hy_v4.ampere.sparse_mla import (
-                HYV4AmpereMLASparseBackend,
-            )
-
-            if kv_cache_dtype in HYV4AmpereMLASparseBackend.supported_kv_cache_dtypes:
-                return HYV4AmpereMLASparseBackend
+        if ampere_cls is not None:
+            return ampere_cls
 
         from .flashmla_sparse import HYV4FlashMLASparseBackend
 
         # Mirror how the selector derives the configuration-dependent inputs so
         # this check accepts exactly what the backend would accept at runtime.
+        capability = current_platform.get_device_capability()
         if capability is None:
             logger.warning_once(
                 "HYV4 learnable sink is unavailable: the device compute "

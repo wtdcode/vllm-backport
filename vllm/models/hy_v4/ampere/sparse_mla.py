@@ -6,6 +6,8 @@ FlashMLA needs SM90+, so SM8x runs the ROCm BF16 Triton sparse MLA kernels,
 which already take `attn_sink` and are plain Triton. The AITER dispatch of
 the ROCm backend is not inherited. Top-k rows are packed and counted before
 each read, as on the ROCm DFly draft path, so any indexer row layout works.
+An fp8_ds_mla cache holds upstream's 656-byte records, which the DeepSeek V4
+single-pass Triton kernel reads with a table decode instead of native fp8.
 """
 
 from dataclasses import dataclass
@@ -28,7 +30,10 @@ from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
     triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
-from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_sparse_attn_prefill
+from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    rocm_sparse_attn_fp8_ds_mla,
+    rocm_sparse_attn_prefill,
+)
 
 
 @dataclass(kw_only=True)
@@ -68,15 +73,18 @@ class HYV4AmpereMLASparseMetadataBuilder(
 
 
 class HYV4AmpereMLASparseImpl(ROCMAiterMLASparseImpl):
-    """BF16 Triton sparse MLA with learnable sinks, without AITER."""
+    """Triton sparse MLA with learnable sinks, without AITER."""
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        if self.kv_cache_dtype not in ("auto", "bfloat16"):
+    def __init__(self, *args, kv_cache_dtype: str, **kwargs) -> None:
+        if kv_cache_dtype not in HYV4AmpereMLASparseBackend.supported_kv_cache_dtypes:
             raise ValueError(
-                "HYV4 sparse MLA on SM8x requires a BF16 KV cache, got "
-                f"kv_cache_dtype={self.kv_cache_dtype}"
+                "HYV4 sparse MLA on SM8x requires a BF16 or fp8_ds_mla KV cache, "
+                f"got kv_cache_dtype={kv_cache_dtype}"
             )
+        # The ROCm impl ties fp8_ds_mla to AITER's reader (gfx950) and ShardQ.
+        base_dtype = "auto" if kv_cache_dtype == "fp8_ds_mla" else kv_cache_dtype
+        super().__init__(*args, kv_cache_dtype=base_dtype, **kwargs)
+        self.kv_cache_dtype = kv_cache_dtype
         if self.dcp_world_size > 1 or self.pcp_world_size > 1:
             raise NotImplementedError(
                 "HYV4 sparse MLA on SM8x does not support context parallelism"
@@ -118,8 +126,19 @@ class HYV4AmpereMLASparseImpl(ROCMAiterMLASparseImpl):
         output = torch.empty(
             (num_tokens, num_heads, self.kv_lora_rank), dtype=q.dtype, device=q.device
         )
-        # Single pass for decode rows too: the split-K BF16 decode reduces over
-        # a power-of-two row width, which the 576-wide latent + RoPE row is not.
+        # Single pass for decode rows too: the split-K decodes reduce over a
+        # power-of-two row width or read the DeepSeek V4 packed record.
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            rocm_sparse_attn_fp8_ds_mla(
+                q,
+                kv,
+                attn_metadata.paged_kv_indices,
+                indptr,
+                self.scale,
+                self._attn_sink(q),
+                output,
+            )
+            return output, None
         rocm_sparse_attn_prefill(
             q=q,
             kv=kv.unsqueeze(1),
@@ -140,7 +159,11 @@ class HYV4AmpereMLASparseImpl(ROCMAiterMLASparseImpl):
 class HYV4AmpereMLASparseBackend(ROCMAiterMLASparseBackend):
     # Keeps the inherited name: shared code keys the row-addressed (non-flat)
     # KV cache view and JIT warmups off it.
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "fp8_ds_mla",
+    ]
 
     @staticmethod
     def get_metadata_cls() -> type[HYV4AmpereMLASparseMetadata]:  # type: ignore[override]

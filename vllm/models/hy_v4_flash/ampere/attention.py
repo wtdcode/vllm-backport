@@ -3,7 +3,7 @@
 """HYV4 Flash attention for SM8x (Ampere/Ada: sm80/sm86/sm89).
 
 Keeps the NVIDIA projections and window indexer, and replaces the SM90+ parts:
-FlashMLA with the BF16 Triton sparse MLA backends and the DeepGEMM IndexPool
+FlashMLA with the Triton sparse MLA backends and the DeepGEMM IndexPool
 with the Triton-scored one.
 """
 

@@ -3246,6 +3246,9 @@ def _sparse_attn_decode_ragged_kernel(
     IS_FNUZ_EXTRA: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    # Main cache is [rows, 656] fp8_ds_mla records (512 e4m3 latents, four
+    # fp32 scales, 64 BF16 RoPE), row pitch `main_cache_stride0`; latent out.
+    ROW_RECORDS: tl.constexpr = False,
 ):
     query_idx = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -3289,11 +3292,18 @@ def _sparse_attn_decode_ragged_kernel(
         valid = in_range & (slot >= 0) & (slot < main_num_rows)
         safe_slot = tl.where(valid, slot, 0)
 
-        block_idx = safe_slot // main_block_size
-        pos_in_block = safe_slot % main_block_size
-        cache_block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
-        token_data_ptr = cache_block_ptr + pos_in_block * 576
-        token_scale_ptr = cache_block_ptr + main_block_size * 576 + pos_in_block * 8
+        if ROW_RECORDS:
+            token_data_ptr = main_cache_ptr + _sparse_kv_row_offset(
+                safe_slot, main_cache_stride0
+            )
+        else:
+            block_idx = safe_slot // main_block_size
+            pos_in_block = safe_slot % main_block_size
+            cache_block_ptr = (
+                main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
+            )
+            token_data_ptr = cache_block_ptr + pos_in_block * 576
+            token_scale_ptr = cache_block_ptr + main_block_size * 576 + pos_in_block * 8
 
         x_uint8 = tl.load(
             token_data_ptr[:, None] + nope_offsets[None, :],
@@ -3301,17 +3311,33 @@ def _sparse_attn_decode_ragged_kernel(
             other=0,
         )
         k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr)
-        encoded_scales = tl.load(
-            token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
-            mask=valid[:, None] & nope_mask[None, :],
-            other=127,
-        )
-        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+        if ROW_RECORDS:
+            scale_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.float32))
+            scales = tl.load(
+                scale_ptr[:, None] + tl.arange(0, NOPE_DIM // 128)[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+            scales = tl.broadcast_to(
+                scales[:, :, None], (BLOCK_K, NOPE_DIM // 128, 128)
+            )
+            scales = tl.reshape(scales, (BLOCK_K, NOPE_DIM))
+        else:
+            encoded_scales = tl.load(
+                token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                mask=valid[:, None] & nope_mask[None, :],
+                other=127,
+            )
+            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
         k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
-        rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+        if ROW_RECORDS:
+            rope_ptr = token_data_ptr + NOPE_DIM + 4 * (NOPE_DIM // 128)
+        else:
+            rope_ptr = token_data_ptr + NOPE_DIM
+        rope_ptr = rope_ptr.to(tl.pointer_type(tl.bfloat16))
         k_rope = tl.load(
             rope_ptr[:, None] + rope_offsets[None, :],
             mask=valid[:, None],
@@ -3332,7 +3358,8 @@ def _sparse_attn_decode_ragged_kernel(
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
         acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
-        acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
+        if not ROW_RECORDS:
+            acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
         m_i = m_new
         l_i = l_new
 
@@ -3435,11 +3462,12 @@ def _sparse_attn_decode_ragged_kernel(
         out_nope,
         mask=head_mask[:, None] & nope_mask[None, :],
     )
-    tl.store(
-        out_row_ptr + NOPE_DIM + rope_offsets[None, :],
-        out_rope,
-        mask=head_mask[:, None],
-    )
+    if not ROW_RECORDS:
+        tl.store(
+            out_row_ptr + NOPE_DIM + rope_offsets[None, :],
+            out_rope,
+            mask=head_mask[:, None],
+        )
 
 
 @triton.jit
@@ -4890,6 +4918,16 @@ def _decode_cu_count() -> int:
         return 256  # For gfx950 arch, gated behind a fallback path for other archs.
 
 
+@functools.lru_cache
+def _fp8_ds_mla_wide_tile() -> bool:
+    """Whether the 32-key tile of the fp8_ds_mla row read (93 KB smem) fits."""
+    try:
+        smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+    except Exception:
+        return False
+    return smem >= 96 * 1024
+
+
 def _decode_partial_iters(
     avg_main_len: float, avg_extra_len: float, splits: int, block_k: int
 ) -> int:
@@ -5718,6 +5756,80 @@ def rocm_sparse_attn_prefill(
             out=output,
             is_mxfp4=kv_cache_dtype == "mxfp4_mla",
         )
+
+
+def rocm_sparse_attn_fp8_ds_mla(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    indptr: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor | None,
+    output: torch.Tensor,
+) -> None:
+    """Single-pass sparse MLA over 656-byte fp8_ds_mla rows.
+
+    Args:
+        q: `[tokens, heads, 576]` BF16 queries.
+        kv: `[rows, 656]` uint8 records as `concat_and_cache_mla` writes them.
+        indices: Ragged physical row per selected key.
+        indptr: `[tokens + 1]` row offsets into `indices`.
+        scale: Softmax scale.
+        attn_sink: `[heads]` fp32 sink logits, or None.
+        output: `[tokens, heads, 512]` BF16 latent output.
+
+    """
+    num_queries, num_heads, head_dim = q.shape
+    assert q.dtype == torch.bfloat16 and head_dim == 576 and q.stride(2) == 1
+    assert kv.dtype == torch.uint8 and kv.ndim == 2 and kv.shape[1] == 656, (
+        f"expected kv=[rows,656] uint8, got {kv.shape} {kv.dtype}"
+    )
+    assert output.shape == (num_queries, num_heads, 512) and output.stride(2) == 1
+    indices = _as_int32_contiguous_1d(indices)
+    indptr = _as_int32_contiguous_1d(indptr)
+    has_attn_sink = attn_sink is not None
+    if attn_sink is None:
+        attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
+    block_h = _decode_block_h(num_heads)
+    head_blocks = triton.cdiv(num_heads, block_h)
+    # One CTA per SM is latency-bound and takes the wide tile on 8 warps;
+    # beyond that the narrow tile's occupancy wins (A100: -15% at 1k tokens).
+    wide = _fp8_ds_mla_wide_tile() and num_queries * head_blocks <= _decode_cu_count()
+    _sparse_attn_decode_ragged_kernel[(num_queries, head_blocks)](
+        q,
+        kv,
+        indices,
+        indptr,
+        kv,
+        indices,
+        indptr,
+        attn_sink,
+        get_e4m3fn_bf16_lut(q.device),
+        output,
+        q.stride(0),
+        q.stride(1),
+        output.stride(0),
+        output.stride(1),
+        kv.stride(0),
+        0,
+        kv.shape[0],
+        0,
+        1,
+        1,
+        float(scale),
+        num_heads,
+        HAS_ATTN_SINK=has_attn_sink,
+        HAS_EXTRA=False,
+        NOPE_DIM=512,
+        NOPE_BLOCK=512,
+        ROPE_DIM=64,
+        IS_FNUZ_MAIN=False,
+        IS_FNUZ_EXTRA=False,
+        BLOCK_H=block_h,
+        BLOCK_K=32 if wide else 16,
+        ROW_RECORDS=True,
+        num_warps=8 if wide else 4,
+    )
 
 
 def rocm_sparse_attn_decode_bf16(
