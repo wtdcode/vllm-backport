@@ -29,6 +29,7 @@ import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_lut, e4m3fn_cache_as_u8
 from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_alibi_to_score,
     apply_softcap,
@@ -115,6 +116,8 @@ def kernel_unified_attention_diffkv(
     # sequence) and 3D layout (split-KV / FlashDecoding-style: per-segm
     # programs write partials, finalized by ``kernel_reduce_segments_diffkv``).
     IS_3D: tl.constexpr,
+    # pre-SM89 CUDA: e4m3 -> bf16 table for uint8 views of an fp8 cache/query.
+    fp8_lut_ptr=None,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -165,6 +168,8 @@ def kernel_unified_attention_diffkv(
         mask=dim_mask_qk[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
+    if fp8_lut_ptr is not None and Q.dtype == tl.uint8:
+        Q = _decode_fp8_lut(Q, False, fp8_lut_ptr)
 
     if USE_Q_SCALE:
         scale *= tl.load(q_descale_ptr)
@@ -230,6 +235,8 @@ def kernel_unified_attention_diffkv(
             mask=dim_mask_qk[:, None] & tile_mask[None, :],
             other=0.0,
         )
+        if fp8_lut_ptr is not None:
+            K_load = _decode_fp8_lut(K_load, False, fp8_lut_ptr)
         K = K_load.to(Q.dtype)
         # V : (TILE_SIZE, HEAD_SIZE_V_PADDED)
         V_load = tl.load(
@@ -237,6 +244,8 @@ def kernel_unified_attention_diffkv(
             mask=dim_mask_v[None, :] & tile_mask[:, None],
             other=0.0,
         )
+        if fp8_lut_ptr is not None:
+            V_load = _decode_fp8_lut(V_load, False, fp8_lut_ptr)
         V = V_load.to(Q.dtype)
 
         query_abs_pos = context_len + query_pos[:, None]
@@ -515,6 +524,12 @@ def unified_attention_diffkv(
         segm_expsum_ptr = out
         num_segments = 1
 
+    k, fp8_lut = e4m3fn_cache_as_u8(k)
+    if fp8_lut is not None:
+        # The kernel decodes K/V, and an fp8 query, through the table.
+        v, _ = e4m3fn_cache_as_u8(v)
+        q, _ = e4m3fn_cache_as_u8(q)
+
     kernel_unified_attention_diffkv[grid](
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
@@ -566,6 +581,7 @@ def unified_attention_diffkv(
         BLOCK_M=BLOCK_M,
         NUM_SEGMENTS_PER_SEQ=num_segments,
         IS_3D=use_3d,
+        fp8_lut_ptr=fp8_lut,
         **launch_kw,
     )
 

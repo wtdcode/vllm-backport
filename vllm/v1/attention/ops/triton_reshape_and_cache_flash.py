@@ -11,6 +11,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.fp8_sm80 import _encode_e4m3fn_u8, e4m3fn_cache_as_u8
 from vllm.v1.kv_cache_interface import KVQuantMode, is_quantized_kv_cache
 
 FP8_MIN, FP8_MAX = get_fp8_min_max()
@@ -25,7 +26,15 @@ def _is_supported_kv_cache_dtype(kv_cache_dtype: str) -> bool:
     ):
         return False
     if kv_cache_dtype.startswith("fp8"):
-        return current_platform.has_device_capability(89) or current_platform.is_xpu()
+        return (
+            current_platform.has_device_capability(89)
+            or current_platform.is_xpu()
+            # SM80-SM88 store through the software e4m3 encoder (fp8_sm80).
+            or (
+                current_platform.is_cuda()
+                and current_platform.has_device_capability(80)
+            )
+        )
     if kv_cache_dtype == "bfloat16":
         return current_platform.has_device_capability(80) or current_platform.is_xpu()
     return True
@@ -143,6 +152,11 @@ def reshape_and_cache_kernel_flash(
     else:
         value_tile = value_load
 
+    if FP8_KV_CACHE and key_cache_ptr.dtype.element_ty == tl.uint8:
+        # pre-SM89 CUDA: uint8 view of an e4m3 cache.
+        key_tile = _encode_e4m3fn_u8(key_tile)
+        value_tile = _encode_e4m3fn_u8(value_tile)
+
     tl.store(
         key_cache_ptr + tgt_idx_k,
         key_tile,
@@ -234,6 +248,9 @@ def _reshape_cache_per_token_head(
         # Round half away from zero before the int8 store truncates.
         k_q = tl.where(k_q >= 0, k_q + 0.5, k_q - 0.5)
     k_q = tl.clamp(k_q, QUANT_MIN, QUANT_MAX)
+    if key_cache_ptr.dtype.element_ty == tl.uint8:
+        # pre-SM89 CUDA: uint8 view of an e4m3 cache.
+        k_q = _encode_e4m3fn_u8(k_q)
     tl.store(
         key_cache_ptr
         + blk * stride_kc_blk
@@ -266,6 +283,8 @@ def _reshape_cache_per_token_head(
         # Round half away from zero before the int8 store truncates.
         v_q = tl.where(v_q >= 0, v_q + 0.5, v_q - 0.5)
     v_q = tl.clamp(v_q, QUANT_MIN, QUANT_MAX)
+    if value_cache_ptr.dtype.element_ty == tl.uint8:
+        v_q = _encode_e4m3fn_u8(v_q)
     tl.store(
         value_cache_ptr
         + blk * stride_vc_blk
@@ -352,6 +371,8 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
         num_warps = 4
     else:
         num_warps = min(16, max(1, head_size_padded // 32))
+    key_cache, _ = e4m3fn_cache_as_u8(key_cache)
+    value_cache, _ = e4m3fn_cache_as_u8(value_cache)
 
     _reshape_cache_per_token_head[(num_tokens, num_kv_heads)](
         key_ptr=key,
@@ -448,6 +469,8 @@ def triton_reshape_and_cache_flash(
         key_cache = key_cache.view(kv_cache_torch_dtype)
         value_cache = value_cache.view(kv_cache_torch_dtype)
     FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
+    key_cache, _ = e4m3fn_cache_as_u8(key_cache)
+    value_cache, _ = e4m3fn_cache_as_u8(value_cache)
     # heuristics instead of autotuning
     TILE_SIZE = min(2048, triton.next_power_of_2(n))
     if current_platform.is_rocm() or current_platform.is_xpu():
@@ -561,6 +584,11 @@ def reshape_and_cache_kernel_flash_diffkv(
     else:
         value_tile = value_load
 
+    if FP8_KV_CACHE and kv_cache_ptr.dtype.element_ty == tl.uint8:
+        # pre-SM89 CUDA: uint8 view of an e4m3 cache.
+        key_tile = _encode_e4m3fn_u8(key_tile)
+        value_tile = _encode_e4m3fn_u8(value_tile)
+
     tl.store(
         kv_cache_ptr + tgt_idx + tile_offs,
         key_tile,
@@ -606,6 +634,7 @@ def triton_reshape_and_cache_flash_diffkv(
         # (e.g. explicit cast to fp8e4m3fnuz is not supported in triton 3.4)
         kv_cache = kv_cache.view(kv_cache_torch_dtype)
     FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
+    kv_cache, _ = e4m3fn_cache_as_u8(kv_cache)
     # heuristics instead of autotuning
     TILE_SIZE = max(head_size_k, head_size_v)
     TILE_SIZE = triton.next_power_of_2(TILE_SIZE)

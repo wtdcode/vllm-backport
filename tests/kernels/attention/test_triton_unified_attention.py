@@ -1076,6 +1076,90 @@ def test_triton_unified_attn_bf16_query_fp8_kv(
     )
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or current_platform.supports_fp8(),
+    reason="pre-SM89 CUDA decodes an fp8 KV cache through a bf16 table",
+)
+@pytest.mark.parametrize("fp8_query", [False, True])
+@pytest.mark.parametrize("seq_threshold_3D", SEQ_THRESHOLD_3D_VALUES)
+@torch.inference_mode()
+def test_triton_unified_attn_fp8_kv_table_decode_matches_bf16_kv(
+    fp8_query: bool, seq_threshold_3D: int
+) -> None:
+    """The table decode is exact: an fp8 cache (and query) gives the output of
+    a bf16 cache holding the same dequantized values."""
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    query_lens, kv_lens = [1, 5, 1], [523, 37, 2011]
+    num_query_heads, num_kv_heads, head_size, block_size = 8, 2, 128, 16
+    num_blocks = 512
+
+    # Power-of-two scales keep the bf16 dequantization exact.
+    q_scale, k_scale, v_scale = (torch.tensor(x) for x in (0.5, 0.25, 2.0))
+    query = torch.randn(sum(query_lens), num_query_heads, head_size).to(FP8_DTYPE)
+    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_size)
+    value_cache = torch.randn_like(key_cache).to(FP8_DTYPE)
+    key_cache = key_cache.to(FP8_DTYPE)
+    if not fp8_query:
+        query = query.to(torch.bfloat16)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    block_tables = torch.randint(
+        0, num_blocks, (len(kv_lens), max(kv_lens) // block_size + 1), dtype=torch.int32
+    )
+    descale_shape = (len(kv_lens), num_kv_heads)
+
+    def run(q, k, v, q_descale, kv_descale, kv_quant_mode):
+        out = torch.empty(q.shape, dtype=torch.float32)
+        rows = seq_threshold_3D * max(query_lens)
+        unified_attention(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=torch.tensor(kv_lens, dtype=torch.int32),
+            max_seqlen_q=max(query_lens),
+            max_seqlen_k=max(kv_lens),
+            softmax_scale=head_size**-0.5,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=block_tables,
+            softcap=0,
+            q_descale=q_descale,
+            k_descale=k_scale.expand(descale_shape) if kv_descale else None,
+            v_descale=v_scale.expand(descale_shape) if kv_descale else None,
+            seq_threshold_3D=seq_threshold_3D,
+            num_par_softmax_segments=16,
+            softmax_segm_output=torch.empty((rows, num_query_heads, 16, head_size)),
+            softmax_segm_max=torch.empty((rows, num_query_heads, 16)),
+            softmax_segm_expsum=torch.empty((rows, num_query_heads, 16)),
+            kv_quant_mode=kv_quant_mode,
+        )
+        return out
+
+    actual = run(
+        query,
+        key_cache,
+        value_cache,
+        q_scale if fp8_query else None,
+        True,
+        KVQuantMode.FP8_PER_TENSOR,
+    )
+    expected = run(
+        query.to(torch.bfloat16) * q_scale if fp8_query else query,
+        key_cache.to(torch.bfloat16) * k_scale,
+        value_cache.to(torch.bfloat16) * v_scale,
+        None,
+        False,
+        KVQuantMode.NONE,
+    )
+    # An fp8 query picks another decode tile size, which moves the bf16
+    # rounding of the softmax weights.
+    torch.testing.assert_close(actual, expected, atol=5e-3, rtol=1e-2)
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [

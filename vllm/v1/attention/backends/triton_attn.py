@@ -35,6 +35,7 @@ from vllm.v1.attention.backends.utils import (
     get_num_attention_heads_from_layers,
     set_triton_ptr_range,
 )
+from vllm.v1.attention.ops.fp8_sm80 import native_fp8_cast_supported
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -514,16 +515,15 @@ class TritonAttentionImpl(AttentionImpl):
             cap = current_platform.get_device_capability()
             cap_str = cap.as_version_str() if cap is not None else "unknown"
             dev = current_platform.get_device_name()
+            # SM80-SM88 emulate fp8e4nv in the kernels (fp8_sm80), which needs
+            # bfloat16.
             if self.kv_cache_dtype.startswith("fp8") and not (
-                current_platform.has_device_capability(89)
+                current_platform.has_device_capability(80)
             ):
-                suggested = (
-                    "float16" if (cap is None or cap.to_int() < 80) else "bfloat16"
-                )
                 raise ValueError(
                     f"FP8 KV cache is not supported by the Triton attention backend "
-                    f"on {dev} (compute capability {cap_str}); native FP8 (fp8e4nv) "
-                    f"requires SM89+. Re-run with --kv-cache-dtype {suggested}."
+                    f"on {dev} (compute capability {cap_str}); it requires SM80+. "
+                    f"Re-run with --kv-cache-dtype float16."
                 )
             if self.kv_cache_dtype == "bfloat16" and not (
                 current_platform.has_device_capability(80)
@@ -553,7 +553,10 @@ class TritonAttentionImpl(AttentionImpl):
             )
         self.use_alibi_sqrt = use_alibi_sqrt
         self.chunk_lookback = chunk_lookback
-        self.supports_quant_query_input = current_platform.is_cuda()
+        # Below SM89 an fp8 query would only be decoded again in the kernel.
+        self.supports_quant_query_input = (
+            current_platform.is_cuda() and native_fp8_cast_supported()
+        )
         if current_platform.is_rocm():
             # Enable GPUs with fp8 MMA support
             from vllm.platforms.rocm import on_gfx11, on_gfx90a

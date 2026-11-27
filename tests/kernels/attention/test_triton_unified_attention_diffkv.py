@@ -241,7 +241,9 @@ def test_triton_unified_attn_diffkv_vs_reference(
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda_alike() or not current_platform.supports_fp8(),
+    # CUDA below SM89 decodes an fp8 query through a table instead.
+    not current_platform.is_cuda_alike()
+    or not (current_platform.supports_fp8() or current_platform.is_cuda()),
     reason="FP8 query requires FP8 support",
 )
 @pytest.mark.parametrize(

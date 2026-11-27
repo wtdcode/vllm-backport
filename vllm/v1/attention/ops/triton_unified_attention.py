@@ -16,6 +16,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_lut, e4m3fn_cache_as_u8
 from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_alibi_to_score,
     apply_softcap,
@@ -415,6 +416,8 @@ def kernel_unified_attention(
     v_cache_delta: tl.int64 = 0,
     K_ALIGN: tl.constexpr = 1,
     V_ALIGN: tl.constexpr = 1,
+    # pre-SM89 CUDA: e4m3 -> bf16 table for uint8 views of an fp8 cache/query.
+    fp8_lut_ptr=None,
 ):
     # Strides as visible multiples of the alignment found by kv_tile_alignment,
     # and V addressed from K, let the K/V tile loads compile to vector loads.
@@ -526,6 +529,10 @@ def kernel_unified_attention(
     if USE_FP8_Q_DESCALE:
         score_scale = scale * tl.load(q_scale) * tl.load(k_scale)
         value_scale = tl.load(v_scale)
+    if fp8_lut_ptr is not None and Q.dtype == tl.uint8:
+        # K/V are dequantized on load, as for a bf16 query.
+        Q = _decode_fp8_lut(Q, False, fp8_lut_ptr)
+        score_scale = scale * tl.load(q_scale)
 
     context_len = seq_len - cur_batch_query_len
 
@@ -636,6 +643,9 @@ def kernel_unified_attention(
                 mask=dim_mask[None, :] & tile_mask[:, None],
                 other=0.0,
             )
+        if fp8_lut_ptr is not None:
+            K_load = _decode_fp8_lut(K_load, False, fp8_lut_ptr)
+            V_load = _decode_fp8_lut(V_load, False, fp8_lut_ptr)
         K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
@@ -1474,6 +1484,14 @@ def unified_attention(
     if k_scale_cache is not None and not use_td:
         k_align, v_align, v_cache_delta = kv_tile_alignment(k, v)
 
+    q_is_fp8 = q.dtype == current_platform.fp8_dtype()
+    k, fp8_lut = e4m3fn_cache_as_u8(k)
+    if fp8_lut is not None:
+        # The kernel decodes K/V, and an fp8 query, through the table.
+        v, _ = e4m3fn_cache_as_u8(v)
+        q, _ = e4m3fn_cache_as_u8(q)
+        q_is_fp8 = False
+
     kernel_unified_attention[grid](
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
@@ -1544,7 +1562,7 @@ def unified_attention(
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
         KV_QUANT_MODE=kv_quant_mode,
-        Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
+        Q_IS_FP8=q_is_fp8,
         CHUNK_LOOKBACK=chunk_lookback,
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
@@ -1554,6 +1572,7 @@ def unified_attention(
         v_cache_delta=v_cache_delta,
         K_ALIGN=k_align,
         V_ALIGN=v_align,
+        fp8_lut_ptr=fp8_lut,
         **launch_kwargs,
     )
 

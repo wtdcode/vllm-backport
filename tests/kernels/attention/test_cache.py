@@ -626,6 +626,54 @@ def test_reshape_and_cache_flash_asymmetric_tiny_head() -> None:
     torch.testing.assert_close(value_cache, expected_value)
 
 
+@pytest.mark.parametrize("diffkv", [False, True])
+@torch.inference_mode()
+def test_triton_reshape_and_cache_flash_fp8_matches_torch_cast(diffkv: bool) -> None:
+    """The Triton fp8 store equals torch's cast bit for bit, also below SM89
+    where the kernel encodes e4m3 in software."""
+    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+        triton_reshape_and_cache_flash,
+        triton_reshape_and_cache_flash_diffkv,
+    )
+
+    set_random_seed(0)
+    torch.set_default_device("cuda:0")
+    fp8_dtype = current_platform.fp8_dtype()
+    num_tokens, num_heads, block_size, num_blocks = 40, 4, 16, 4
+    head_size, v_head_size = (192, 128) if diffkv else (128, 128)
+
+    packed = torch.zeros(
+        num_blocks, num_heads, block_size, head_size + v_head_size, dtype=fp8_dtype
+    )
+    cache = packed.transpose(1, 2)
+    slot_mapping = torch.randperm(num_blocks * block_size)[:num_tokens]
+    slot_mapping[3] = -1
+    # Spans e4m3 subnormals up to the largest normal binade.
+    spread = torch.logspace(-3, 1.5, head_size, dtype=torch.float32)
+    key = (torch.randn(num_tokens, num_heads, head_size) * spread).to(torch.bfloat16)
+    value = key[..., :v_head_size].flip(0).contiguous()
+    k_scale, v_scale = torch.tensor(0.5), torch.tensor(0.25)
+
+    if diffkv:
+        triton_reshape_and_cache_flash_diffkv(
+            key, value, cache, slot_mapping, "fp8", k_scale, v_scale
+        )
+    else:
+        key_cache, value_cache = cache.split(head_size, dim=-1)
+        triton_reshape_and_cache_flash(
+            key, value, key_cache, value_cache, slot_mapping, "fp8", k_scale, v_scale
+        )
+
+    expected = torch.zeros_like(cache).flatten(0, 1)
+    valid = slot_mapping >= 0
+    expected[slot_mapping[valid]] = torch.cat(
+        [key.float() / k_scale, value.float() / v_scale], dim=-1
+    ).to(fp8_dtype)[valid]
+    assert torch.equal(
+        cache.flatten(0, 1).view(torch.uint8), expected.view(torch.uint8)
+    )
+
+
 @pytest.mark.parametrize("kv_cache_layout", ASYM_LAYOUTS)
 @pytest.mark.parametrize("kv_scale_type", KV_SCALE_TYPES)
 @pytest.mark.parametrize("kv_cache_dtype", KV_CACHE_DTYPE)
