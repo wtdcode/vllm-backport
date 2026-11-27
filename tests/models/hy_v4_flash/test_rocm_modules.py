@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """HYV4 Flash ROCm (`amd/`) IndexPool indexer and latent MoE modules against
-pure-torch references built from the same weights, on gfx950."""
+pure-torch references built from the same weights, on gfx950. The indexer
+tests also cover its SM8x subclass on CUDA."""
 
 from types import SimpleNamespace
 
@@ -30,6 +31,20 @@ def _is_rocm_gfx950() -> bool:
 
 requires_rocm_gfx950 = pytest.mark.skipif(
     not _is_rocm_gfx950(), reason="HYV4 Flash ROCm modules require gfx950"
+)
+
+
+def _is_cuda_sm8x() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_cuda() and capability is not None and capability.major == 8
+    )
+
+
+# The SM8x IndexPool is the ROCm one scored by the LUT-decoding Triton kernel.
+requires_indexpool_device = pytest.mark.skipif(
+    not (_is_rocm_gfx950() or _is_cuda_sm8x()),
+    reason="HYV4 Flash ROCm IndexPool requires gfx950 or CUDA SM8x",
 )
 
 
@@ -64,9 +79,15 @@ class _IndexerHarness:
 
     def __init__(self, num_heads, group_topk, three_axis, num_requests=4):
         from vllm.config import CacheConfig
-        from vllm.models.hy_v4_flash.amd.compressed_indexer import (
-            FlashCompressedIndexer,
-        )
+
+        if _is_cuda_sm8x():
+            from vllm.models.hy_v4_flash.ampere.compressed_indexer import (
+                FlashAmpereCompressedIndexer as FlashCompressedIndexer,
+            )
+        else:
+            from vllm.models.hy_v4_flash.amd.compressed_indexer import (
+                FlashCompressedIndexer,
+            )
 
         self.budget = group_topk - 1
         self.three_axis = three_axis
@@ -278,7 +299,7 @@ _STEPS = [
 ]
 
 
-@requires_rocm_gfx950
+@requires_indexpool_device
 @pytest.mark.parametrize(
     "num_heads,three_axis,chunked",
     [(16, False, False), (16, True, True), (4, True, False), (4, False, True)],
@@ -303,7 +324,7 @@ def test_compressed_indexer_matches_reference(
         _assert_pool_matches_reference(harness, request, end // _RATIO)
 
 
-@requires_rocm_gfx950
+@requires_indexpool_device
 def test_compressed_indexer_cuda_graph_replay(
     dist_init, default_vllm_config, workspace_init
 ):
@@ -347,7 +368,7 @@ def test_compressed_indexer_cuda_graph_replay(
         _assert_pool_matches_reference(harness, request, (n + 4) // _RATIO)
 
 
-@requires_rocm_gfx950
+@requires_indexpool_device
 def test_compressed_indexer_without_tokens_returns_dead_rows(
     dist_init, default_vllm_config, workspace_init
 ):

@@ -4,7 +4,7 @@
 
 NVIDIA and ROCm implementations live in `nvidia/` and `amd/`, with
 vendor-neutral code in `common/`; this module dispatches on the current
-platform.
+platform. `ampere/` overrides the NVIDIA model for SM8x GPUs.
 """
 
 from importlib import import_module
@@ -31,6 +31,10 @@ def platform_module(name: str) -> ModuleType:
     from vllm.platforms import current_platform
 
     platform = "amd" if current_platform.is_rocm() else "nvidia"
+    if platform == "nvidia" and name == "model":
+        capability = current_platform.get_device_capability()
+        if capability is not None and capability.major == 8:
+            platform = "ampere"
     return import_module(f".{platform}.{name}", __name__)
 
 

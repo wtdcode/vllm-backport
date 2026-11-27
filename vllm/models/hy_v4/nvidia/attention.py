@@ -595,11 +595,20 @@ class HYV4MLAAttention(nn.Module):
         if selected_cls.supports_sink():
             return selected_cls
 
+        capability = current_platform.get_device_capability()
+        if self.is_sparse and capability is not None and capability.major == 8:
+            # FlashMLA needs SM90+; SM8x applies sinks in the Triton kernels.
+            from vllm.models.hy_v4.ampere.sparse_mla import (
+                HYV4AmpereMLASparseBackend,
+            )
+
+            if kv_cache_dtype in HYV4AmpereMLASparseBackend.supported_kv_cache_dtypes:
+                return HYV4AmpereMLASparseBackend
+
         from .flashmla_sparse import HYV4FlashMLASparseBackend
 
         # Mirror how the selector derives the configuration-dependent inputs so
         # this check accepts exactly what the backend would accept at runtime.
-        capability = current_platform.get_device_capability()
         if capability is None:
             logger.warning_once(
                 "HYV4 learnable sink is unavailable: the device compute "

@@ -29,6 +29,14 @@ from vllm.models.hy_v4.nvidia.triton_ihc import (
     triton_ihc_pre,
     triton_ihc_supported,
 )
+from vllm.platforms import current_platform
+
+
+def _ihc_boundary_supported(hc_mult: int, hidden_size: int) -> bool:
+    # The op schema is always registered; its kernels are built for SM90+ only.
+    return current_platform.has_device_capability(
+        90
+    ) and ops.hy_v4_ihc_boundary_supported(hc_mult, hidden_size)
 
 
 class HYV4HCPreLayer(nn.Module):
@@ -239,7 +247,7 @@ class HYV4HCHeadLayer(nn.Module):
         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
         self.packed_gate: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
-        if ops.hy_v4_ihc_boundary_supported(hc_mult, hidden_size):
+        if _ihc_boundary_supported(hc_mult, hidden_size):
             self._pack_gate()
 
         self.reset_parameters(init_std, base_noise_std)
@@ -384,7 +392,7 @@ class HYV4HCLayer(nn.Module):
                 prefix=f"{prefix}.hc_pre",
             )
             self.hc_post = HYV4HCPostLayer(config)
-        self.fused_post = self.enable_ihc and ops.hy_v4_ihc_boundary_supported(
+        self.fused_post = self.enable_ihc and _ihc_boundary_supported(
             config.hc_mult, config.hidden_size
         )
 
@@ -487,7 +495,7 @@ class IHCBoundary(nn.Module):
 
     @staticmethod
     def supported(config: PreTrainedConfig) -> bool:
-        return ops.hy_v4_ihc_boundary_supported(config.hc_mult, config.hidden_size)
+        return _ihc_boundary_supported(config.hc_mult, config.hidden_size)
 
     def forward(
         self,

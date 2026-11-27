@@ -87,6 +87,11 @@ class FlashCompressedIndexer(nn.Module):
             tail=True,
         )
 
+    def _paged_mqa_logits(self, query, cache, weights, lengths, table, width):
+        return rocm_fp8_paged_mqa_logits(
+            query, cache, weights, lengths, table, None, width, cache_layout="NORMAL"
+        )
+
     def forward(self, hidden_states, q_c, positions, rope=None):
         output = self.topk_indices_buffer[: hidden_states.shape[0]]
         output.fill_(-1)
@@ -192,15 +197,13 @@ class FlashCompressedIndexer(nn.Module):
             bounds = upper[begin:end]
             lengths = bounds.clamp_min(1).int()[:, None].contiguous()
             table = km.block_table[owner[begin:end]].contiguous()
-            logits = rocm_fp8_paged_mqa_logits(
+            logits = self._paged_mqa_logits(
                 quant_q[begin:end].contiguous(),
                 cache.unsqueeze(2),
                 weights[begin:end].contiguous(),
                 lengths,
                 table,
-                None,
                 width,
-                cache_layout="NORMAL",
             )
             recalled = select_groups(logits, bounds, self.group_budget)
             output[begin:end].copy_(

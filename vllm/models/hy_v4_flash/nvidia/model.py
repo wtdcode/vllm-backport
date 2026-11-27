@@ -35,6 +35,8 @@ def validate_platform() -> None:
 
 
 class HYV4FlashDecoderLayer(HYV4DecoderLayer):
+    attention_cls: type[HYV4FlashAttention] = HYV4FlashAttention
+
     def __init__(
         self,
         config: HYV4FlashConfig,
@@ -52,7 +54,7 @@ class HYV4FlashDecoderLayer(HYV4DecoderLayer):
         self.enable_ihc = config.enable_ihc
         assert not ihc_sequence_parallel
         self.defer_reduction = False
-        self.self_attn = HYV4FlashAttention(
+        self.self_attn = self.attention_cls(
             vllm_config,
             config,
             self.layer_idx,

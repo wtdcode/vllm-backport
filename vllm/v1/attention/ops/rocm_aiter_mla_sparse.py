@@ -4783,7 +4783,10 @@ def _prefill_block_k(head_dim: int) -> int:
         return 16
     # Two CTAs of the wide tile plus headroom; below this the wide tile either
     # will not launch or drops to 1 CTA/SM, which measured slower than 16.
-    return 32 if smem >= 96 * 1024 else 16
+    # A non-power-of-two row (576) pads BLOCK_D to 1024: 147,968 B at 32,
+    # 82,176 B at 16, so only A100-class parts take the wide tile there.
+    wide_tile_smem = 160 * 1024 if head_dim & (head_dim - 1) else 96 * 1024
+    return 32 if smem >= wide_tile_smem else 16
 
 
 def _can_use_aiter_sparse_prefill_opus(

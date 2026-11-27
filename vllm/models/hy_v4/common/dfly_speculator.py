@@ -553,6 +553,9 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
             descriptor = self.cudagraph_manager.dispatch(
                 batch, count, uniform_token_count=query_width, num_active_loras=0
             )
+            if descriptor.cg_mode == CUDAGraphMode.NONE:
+                # Eager token-bucket padding would split a query block.
+                descriptor = BatchExecutionDescriptor(CUDAGraphMode.NONE, count, batch)
         padded_count = descriptor.num_tokens
         assert padded_count % query_width == 0
         padded_batch = padded_count // query_width
