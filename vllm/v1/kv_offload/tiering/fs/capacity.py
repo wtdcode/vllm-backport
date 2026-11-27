@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-LRU capacity manager for the file system KV offload tier.
+"""LRU capacity manager for the file system KV offload tier.
 
 The fs tier has no inherent size bound: every offloaded chunk becomes a file
 and nothing ever deletes them. FsCapacityManager tracks the tier's chunk files

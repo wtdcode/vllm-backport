@@ -111,6 +111,7 @@ def test_model_without_the_hooks_is_rejected():
     spec = DSparkSpeculator.__new__(DSparkSpeculator)
     spec.use_local_argmax_reduction = True
     spec.speculative_config = SimpleNamespace(draft_sample_method="greedy")
+    spec._draft_topk = None
     spec.model = SimpleNamespace()
     with pytest.raises(ValueError, match="compute_draft_logits_shard"):
         spec._validate_local_argmax_reduction()

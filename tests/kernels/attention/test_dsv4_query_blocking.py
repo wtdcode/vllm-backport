@@ -446,7 +446,8 @@ def test_blocked_prefill_kernel_matches_the_per_query_kernel(
         q.stride(0), q.stride(1), q.stride(2), kv.stride(0), kv.stride(1),
         expected.stride(0), expected.stride(1), expected.stride(2),
         heads, dim, kv.shape[0], scale,
-        HAS_ATTN_SINK=True, BLOCK_H=block_h, BLOCK_D=dim, BLOCK_K=block_k,
+        HAS_ATTN_SINK=True, IS_MXFP4=False, OUT_DV=dim,
+        BLOCK_H=block_h, BLOCK_D=dim, BLOCK_K=block_k,
         EXACT_TILE=True, num_warps=4,
     )  # fmt: skip
 

@@ -11,6 +11,7 @@ whatever the production heuristic picks.
 Examples:
     python benchmarks/kernels/benchmark_dsv4_sm80.py --kernel sparse-decode
     python benchmarks/kernels/benchmark_dsv4_sm80.py --kernel all
+
 """
 
 import argparse
@@ -1455,10 +1456,10 @@ def _launch_dequant_gather(
     num_workers: int,
 ) -> None:
     from vllm.models.deepseek_v4.common.ops.cache_utils import (
-        _dequantize_and_gather_k_kernel,
+        DequantizeAndGatherKCacheKernel,
     )
 
-    _dequantize_and_gather_k_kernel[(seq_lens.shape[0], num_workers)](
+    DequantizeAndGatherKCacheKernel.kernel[(seq_lens.shape[0], num_workers)](
         out,
         out.stride(0),
         out.stride(1),
@@ -2637,7 +2638,7 @@ def bench_dense_gemv(ms: list[int], block_ns: list[int], device: torch.device) -
     rows = []
     # Best us per (arm, shape) for the per-step summary.
     step_us: dict[str, dict[str, float]] = {}
-    for name, k, n, count in _DENSE_GEMM_SHAPES:
+    for name, k, n, _count in _DENSE_GEMM_SHAPES:
         w = torch.randn(n, k, dtype=torch.bfloat16, device=device) * 0.02
         w_fp8, scales = _fp8_block_quant(w)
         w_dq = _fp8_block_dequant(w_fp8, scales)

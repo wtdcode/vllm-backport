@@ -8,12 +8,16 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group
-from vllm.distributed.utils import get_pp_indices
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
+
+from .ngram_embedding import (
+    Qwen4ExpNGramEmbedding,
+    Qwen4ExpPLEHostStagedEmbedding,
+    stage_host_rows,
+)
 
 
 class Qwen4ExpModelState(MambaHybridModelState):
@@ -28,28 +32,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
-        has_ple_layers = bool(config.ple_layer_ids)
-        pp_group = get_pp_group()
-        if has_ple_layers and pp_group.world_size > 1:
-            # Non-first pipeline ranks receive intermediate tensors instead of
-            # the raw input_ids PLE needs, so every PLE layer must live on the
-            # first stage, which is the only rank preparing the PLE inputs.
-            _, first_stage_end = get_pp_indices(
-                config.num_hidden_layers, 0, pp_group.world_size
-            )
-            misplaced = sorted(
-                int(layer_id)
-                for layer_id in config.ple_layer_ids
-                if int(layer_id) - 1 >= first_stage_end
-            )
-            if misplaced:
-                raise RuntimeError(
-                    "N-gram PLE embedding requires every PLE layer on the first "
-                    f"pipeline stage (layers 1..{first_stage_end}), but "
-                    f"ple_layer_ids={misplaced} fall on later stages. Adjust "
-                    "VLLM_PP_LAYER_PARTITION or run with PP=1."
-                )
-        self.uses_ngram_embedding = has_ple_layers and pp_group.is_first_rank
+        self.uses_ngram_embedding = bool(config.ple_layer_ids)
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -78,6 +61,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        self.host_staged_modules = [
+            (module, module.ngram_embedding)
+            for module in model.modules()
+            if isinstance(module, Qwen4ExpNGramEmbedding)
+            and isinstance(module.ngram_embedding, Qwen4ExpPLEHostStagedEmbedding)
+        ]
 
     def _prepare_ngram_context(
         self,
@@ -121,9 +110,17 @@ class Qwen4ExpModelState(MambaHybridModelState):
         query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)
         # Represent unused capacity as trailing zero-length requests.
         query_start_loc[num_reqs_padded + 1 :].copy_(input_batch.query_start_loc[-1])
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
+        if self.host_staged_modules:
+            stage_host_rows(
+                self.host_staged_modules,
+                input_batch.input_ids,
+                query_start_loc,
+                ngram_context,
+            )
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
         return model_inputs
 

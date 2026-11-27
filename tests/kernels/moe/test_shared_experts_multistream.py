@@ -52,7 +52,6 @@ def _shared_experts(layer: torch.nn.Module) -> SharedExperts:
         moe_config=SimpleNamespace(moe_parallel_config=parallel),
         enable_dbo=False,
         mk_can_overlap_shared_experts=lambda: False,
-        is_multistream_safe=lambda: True,
     )
 
 
@@ -66,8 +65,7 @@ def test_decode_width_runs_on_aux_stream_and_matches_serial() -> None:
     x = torch.randn(8, HIDDEN, device="cuda", dtype=torch.bfloat16)
     expected = layer.proj(x)
 
-    assert not shared.maybe_forward_async(x)
-    shared.maybe_sync_shared_experts_stream(x)
+    assert shared.maybe_sync_shared_experts_stream(x)
     assert shared(x, SharedExpertsOrder.NO_OVERLAP) is None
     shared(x, SharedExpertsOrder.MULTI_STREAM_OVERLAPPED)
 
@@ -88,7 +86,8 @@ def test_above_threshold_stays_serial_on_main_stream() -> None:
     )
     expected = layer.proj(x)
 
-    shared.maybe_sync_shared_experts_stream(x)
+    assert not shared.maybe_sync_shared_experts_stream(x)
+    assert not shared.maybe_forward_async(x)
     shared(x, SharedExpertsOrder.NO_OVERLAP)
     assert shared(x, SharedExpertsOrder.MULTI_STREAM_OVERLAPPED) is None
 

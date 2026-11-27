@@ -3,8 +3,8 @@
 """Tests for DeepSeek V3.2 parser engine semantics.
 
 V3.2 uses the same DSML parameter format as V4 but wraps tool calls in
-``<｜DSML｜function_calls>`` instead of ``<｜DSML｜tool_calls>`` and has
-no reasoning (``<think>``/``</think>``) support.
+`<｜DSML｜function_calls>` instead of `<｜DSML｜tool_calls>` and has
+no reasoning (`<think>`/`</think>`) support.
 """
 
 import json

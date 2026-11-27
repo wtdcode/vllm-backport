@@ -5,17 +5,17 @@ from typing import Any
 
 import torch
 
+from vllm.model_executor.warmup.jit_warmup import kernel_launcher
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
     TritonWarmupTensor,
     VllmTritonJitKernel,
-    kernel_launcher,
 )
 from vllm.triton_utils import tl, triton
 
 
 class PackSeqTritonKernel(VllmTritonJitKernel["PackSeqTritonKernel.CompileKey"]):
-    @dataclass(frozen=True)
+    @dataclass(frozen=True, slots=True)
     class CompileKey:
         dtype: torch.dtype
         pad_value: float | int
@@ -80,7 +80,7 @@ class PackSeqTritonKernel(VllmTritonJitKernel["PackSeqTritonKernel.CompileKey"])
         x_vals = tl.load(x_row_ptr, mask=valid_row[:, None] & d_mask)
         tl.store(out_row_ptr, x_vals, mask=valid_row[:, None] & d_mask)
 
-    def dispatch(  # type: ignore[override]
+    def dispatch(
         self,
         *,
         dtype: torch.dtype,
@@ -166,6 +166,13 @@ _FP8_DTYPES = frozenset(
 )
 
 
+@triton.jit
+def pack_ue8m0_x4(scale):
+    """Encode a power-of-two fp32 scale as four equal packed UE8M0 bytes, the
+    MX scales of a 128-wide row (see `mqa_logits_use_mx_scales`)."""
+    return ((scale.to(tl.int32, bitcast=True) >> 23) & 0xFF) * 0x01010101
+
+
 def pack_seq_triton(
     x: torch.Tensor,
     lengths: torch.Tensor,
@@ -175,21 +182,22 @@ def pack_seq_triton(
 ) -> torch.Tensor:
     """Pack sequences of different lengths into a batched tensor.
 
-    Supports float dtypes (any, via fp32 pad) and ``torch.uint8`` (exact-byte
+    Supports float dtypes (any, via fp32 pad) and `torch.uint8` (exact-byte
     pad — e.g. MXFP4 packed nibbles or ue8m0 scale bytes). For uint8 inputs
-    ``pad_value`` must be an integer in ``[0, 255]``.
+    `pad_value` must be an integer in `[0, 255]`.
 
     Args:
         x: [N, ...] — input tensor where N is total number of tokens.
         lengths: [B] — sequence lengths for each batch.
-        pad_value: value to use for padding. Defaults to ``-inf`` which is
-            only sensible for float dtypes; pass ``0`` (or any byte) for
+        pad_value: value to use for padding. Defaults to `-inf` which is
+            only sensible for float dtypes; pass `0` (or any byte) for
             uint8 inputs.
         block_t: block size for time dimension.
         block_d: block size for feature dimension.
 
     Returns:
         packed: [B, Lmax, ...] — packed tensor.
+
     """
     # fp8 tensors are packed as raw bytes: a float8 pointer argument does not
     # compile in Triton below SM89, and the pad slots are masked downstream
@@ -245,7 +253,7 @@ def pack_seq_triton(
 
 
 class UnpackSeqTritonKernel(VllmTritonJitKernel["UnpackSeqTritonKernel.CompileKey"]):
-    @dataclass(frozen=True)
+    @dataclass(frozen=True, slots=True)
     class CompileKey:
         dtype: torch.dtype
         block_t: int
@@ -298,7 +306,7 @@ class UnpackSeqTritonKernel(VllmTritonJitKernel["UnpackSeqTritonKernel.CompileKe
         packed_vals = tl.load(packed_row_ptr, mask=valid_row[:, None] & d_mask)
         tl.store(out_row_ptr, packed_vals, mask=valid_row[:, None] & d_mask)
 
-    def dispatch(  # type: ignore[override]
+    def dispatch(
         self,
         *,
         dtype: torch.dtype,
@@ -355,8 +363,7 @@ def unpack_seq_triton(
     block_t: int = 64,
     block_d: int = 64,
 ) -> torch.Tensor:
-    """
-    Unpack a packed decode query tensor back to the original format.
+    """Unpack a packed decode query tensor back to the original format.
     Efficient Triton implementation.
 
     Args:
@@ -367,8 +374,8 @@ def unpack_seq_triton(
 
     Returns:
         unpacked_tensor: [N, ...] where N = sum(lengths)
-    """
 
+    """
     # Handle multi-dimensional input by reshaping to (B, Lmax, -1)
     original_shape = packed_tensor.shape
     if len(original_shape) > 3:

@@ -107,6 +107,10 @@ def _make_speculator(model, use_shard: bool, num_reqs: int, fused: bool = False)
     spec.use_local_argmax_reduction = use_shard
     spec.draft_logits = None
     spec._fused_markov = None
+    spec._draft_topk = None
+    spec.use_confidence_head = False
+    spec._fuse_markov_bias = False
+    spec.acceptance_estimator = None
     if fused:
         assert use_shard, "the fused step only exists on the sharded path"
         spec._fused_markov = build_fused_markov_sampler(

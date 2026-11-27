@@ -59,18 +59,18 @@ def reduce_global_argmax(
 ) -> torch.Tensor:
     """Reduce per-shard maxima that already carry global vocab ids.
 
-    ``values`` and ``global_ids`` are ``[..., num_shards]``; the result is
-    ``[...]``. Ties resolve to the lowest global id, taken as the minimum id
+    `values` and `global_ids` are `[..., num_shards]`; the result is
+    `[...]`. Ties resolve to the lowest global id, taken as the minimum id
     among the shards that reach the maximum, so the result depends neither on
-    shard order nor on ``torch.argmax``'s tie-break. That rule is the one that
+    shard order nor on `torch.argmax`'s tie-break. That rule is the one that
     matches a replicated argmax over the concatenated vocab, which returns the
     first -- i.e. lowest -- maximal index.
 
     The masked-out lanes carry the row's largest id rather than a sentinel, so
     the result is always an id some shard offered. That matters for a NaN row,
-    where ``values == best`` is false everywhere: an out-of-vocab id would be
+    where `values == best` is false everywhere: an out-of-vocab id would be
     returned into an embedding lookup and fail as an async device-side assert,
-    while a replicated ``argmax`` on the same row returns a valid (if
+    while a replicated `argmax` on the same row returns a valid (if
     meaningless) token.
     """
     best = values.max(dim=-1, keepdim=True).values
@@ -100,9 +100,9 @@ class LogitsProcessor(PluggableLayer):
         logits_as_input: bool = False,
         soft_cap: float | None = None,
     ) -> None:
-        """
-        Args:
-            scale: A scaling factor to apply to the logits.
+        """Args:
+        scale: A scaling factor to apply to the logits.
+
         """
         super().__init__()
         self.scale = scale
@@ -137,9 +137,13 @@ class LogitsProcessor(PluggableLayer):
             )
         if logits is not None:
             if self.soft_cap is not None:
-                logits = logits / self.soft_cap
-                logits = torch.tanh(logits)
-                logits = logits * self.soft_cap
+                # In place unless the caller owns the logits, so that no second
+                # logits-sized tensor is live.
+                if self.logits_as_input:
+                    logits = logits / self.soft_cap
+                else:
+                    logits.div_(self.soft_cap)
+                logits.tanh_().mul_(self.soft_cap)
 
             if self.scale != 1.0:
                 logits *= self.scale
@@ -183,15 +187,15 @@ class LogitsProcessor(PluggableLayer):
             )
         if (
             self.head_dtype == torch.float32
-            and (current_platform.is_cuda() or current_platform.is_rocm())
-            and hidden_states.is_cuda
+            and (current_platform.is_cuda_alike() or current_platform.is_xpu())
+            and hidden_states.device.type == current_platform.device_type
         ):
             # Accumulate the projection directly into fp32. This avoids
             # materializing an fp32 copy of the lm_head weight on every step,
             # unlike casting both operands. `torch.mm(out_dtype=...)` only
             # supports fp32 output for fp16/bf16 inputs, and is only
-            # implemented for CUDA and ROCm (the latter via the non-Lt GEMM
-            # path); other platforms fall back to the cast path below.
+            # implemented for CUDA, ROCm (via the non-Lt GEMM path) and XPU;
+            # other platforms fall back to the cast path below.
             flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             logits = torch.mm(flat, lm_head.weight.t(), out_dtype=self.head_dtype)
             if embedding_bias is not None:
@@ -224,6 +228,21 @@ class LogitsProcessor(PluggableLayer):
             logits = logits[..., : self.org_vocab_size]
         return logits
 
+    def _mask_outside_vocab(
+        self, logits: torch.Tensor, lm_head: VocabParallelEmbedding
+    ) -> None:
+        """Mask this shard's padding and any head rows past `org_vocab_size`.
+
+        A head shared with another model can have rows past this processor's
+        vocabulary, as `_get_logits` drops them.
+        """
+        shard_indices = lm_head.shard_indices
+        if shard_indices.num_org_vocab_padding > 0:
+            logits[..., -shard_indices.num_org_vocab_padding :] = -float("inf")
+        cutoff = self.org_vocab_size - shard_indices.org_vocab_start_index
+        if cutoff < logits.shape[-1]:
+            logits[..., max(cutoff, 0) :] = -float("inf")
+
     def get_shard_logits(
         self,
         lm_head: VocabParallelEmbedding,
@@ -233,32 +252,28 @@ class LogitsProcessor(PluggableLayer):
     ) -> torch.Tensor:
         """This rank's slice of the logits, stopping before the vocab gather.
 
-        Everything :meth:`forward` applies elementwise (soft cap, scale) but
-        without the all-gather, plus the padding mask that makes an argmax over
-        the slice safe. The mask is not cosmetic: a shard whose vocab range
-        runs past ``org_vocab_size`` holds rows the weight loader zero-fills
-        (``vocab_parallel_embedding.py:485``), so a padded column scores 0 and
-        wins outright whenever every real logit is negative. :meth:`forward`
-        avoids this by truncating *after* the gather, which a sharded consumer
-        cannot do.
+        Everything `forward` applies elementwise (soft cap, scale) but without
+        the all-gather, plus the mask that makes an argmax over the slice
+        safe: a shard's padding rows are zero-filled by the weight loader, so
+        a padded column scores 0 and wins outright whenever every real logit
+        is negative. `forward` avoids this by truncating *after* the gather,
+        which a sharded consumer cannot do.
 
-        ``extra_logits`` is an optional ``[*, shard_width]`` term added before
+        `extra_logits` is an optional `[*, shard_width]` term added before
         the mask, for a selection that spans the sum of two vocab-parallel
         projections over the same shard layout -- DSpark's Markov transition
         bias on top of the base draft logits.
         """
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        # In place, so that no second logits-sized tensor is live.
         if self.soft_cap is not None:
-            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+            logits.div_(self.soft_cap).tanh_().mul_(self.soft_cap)
         if self.scale != 1.0:
-            logits = logits * self.scale
+            logits *= self.scale
         if extra_logits is not None:
             logits = logits + extra_logits
 
-        # Mask out padding entries beyond org_vocab_size on this shard.
-        num_pad = lm_head.shard_indices.num_org_vocab_padding
-        if num_pad > 0:
-            logits[..., -num_pad:] = -float("inf")
+        self._mask_outside_vocab(logits, lm_head)
         return logits
 
     def get_top_tokens(
@@ -313,6 +328,8 @@ class LogitsProcessor(PluggableLayer):
         hidden_states: torch.Tensor,
         k: int,
         embedding_bias: torch.Tensor | None = None,
+        *,
+        return_log_probs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Vocab-parallel top-k without all-gathering full logits.
 
@@ -320,7 +337,9 @@ class LogitsProcessor(PluggableLayer):
         the values as well as the global ids. Communication is
         O(batch * 2k * tp_size) rather than O(batch * vocab_size).
 
-        Scale and soft cap are applied to the k selected values rather than
+        With return_log_probs, values use the full-vocabulary log-partition.
+
+        Otherwise scale and soft cap are applied to the k selected values rather than
         the whole vocabulary; both are monotonic, so the selection is the same
         and only k entries are touched.
         """
@@ -331,11 +350,22 @@ class LogitsProcessor(PluggableLayer):
             )
 
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        if return_log_probs:
+            if self.soft_cap is not None:
+                logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+            if self.scale != 1.0:
+                logits = logits * self.scale
 
-        # Mask out padding entries beyond org_vocab_size on this shard.
-        num_pad = lm_head.shard_indices.num_org_vocab_padding
-        if num_pad > 0:
-            logits[..., -num_pad:] = -float("inf")
+        self._mask_outside_vocab(logits, lm_head)
+
+        if return_log_probs:
+            log_partition = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
+            if lm_head.tp_size > 1:
+                log_partition = torch.logsumexp(
+                    tensor_model_parallel_all_gather(log_partition, dim=-1),
+                    dim=-1,
+                    keepdim=True,
+                )
 
         values, ids = _topk(logits, k)
         # Convert shard-local indices to global vocab indices.
@@ -348,6 +378,8 @@ class LogitsProcessor(PluggableLayer):
             ids = ids.gather(-1, selected)
 
         values = values.float()
+        if return_log_probs:
+            return ids, values - log_partition
         if self.scale != 1.0:
             values = values * self.scale
         if self.soft_cap is not None:

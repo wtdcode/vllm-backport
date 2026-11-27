@@ -11,7 +11,7 @@ The claim was audited on SM80 (2026-08-03) and did NOT reproduce, at either
 level: 2x 286/286 correct end-to-end requests across every kernel-path tier,
 and 183/183 direct kernel checks (this test's cases). The reporter ran a
 0.25.2-era fork with a vendored third-party kernel, not this tree's
-csrc/libtorch_stable/topk.cu. This test pins the in-band behaviour so any
+csrc/attention/dsa/topk/topk.cu. This test pins the in-band behaviour so any
 future topk.cu change that regresses it fails loudly rather than silently.
 
 Poison values above ``lengths`` mirror production, which calls the indexer

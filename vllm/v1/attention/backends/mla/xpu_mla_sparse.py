@@ -13,7 +13,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     get_mla_dims,
 )
-from vllm.utils.torch_utils import is_quantized_kv_cache, np_to_pinned_tensor
+from vllm.model_executor.layers.attention.sparse_mla_attention import (
+    SharedTopkIndicesBuffer,
+)
+from vllm.utils.torch_utils import np_to_pinned_tensor
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -24,11 +27,12 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    align_blocks_to_rows,
     flat_kv_row_view,
     triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
@@ -46,6 +50,10 @@ class XPUMLASparseBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
         return "XPU_MLA_SPARSE"
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        return align_blocks_to_rows(spec)
 
     @staticmethod
     def get_metadata_cls() -> type["XPUMLASparseMetadata"]:
@@ -125,7 +133,7 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
 
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
-        self.topk_tokens = vllm_config.model_config.hf_config.index_topk
+        self.topk_tokens = vllm_config.model_config.hf_text_config.index_topk
         self.topk_tokens_tensor = torch.tensor(
             [self.topk_tokens], device=device, dtype=torch.int32
         )
@@ -183,7 +191,7 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         return metadata
 
 
-class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
+class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndicesBuffer):
     is_sparse = True
 
     def __init__(
@@ -210,13 +218,13 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         self.softmax_scale = scale
-        self._indexer = indexer
-        # The indexer carries the shared buffer for normal layers and tests;
-        # the explicitly-passed buffer covers backbone skip layers, whose
-        # indexer is not constructed (see deepseek_v2.py).
-        self.topk_indices_buffer: torch.Tensor | None = (
-            indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
-        )
+        self.init_topk_indices_buffer(indexer, topk_indices_buffer)
+
+    def record_logical_topk_ready(self) -> None:
+        # Called unconditionally by MLAAttention.forward for sparse layers. This
+        # impl shares the top-k buffer via SharedTopkIndicesBuffer but does not
+        # participate in sparse-MLA index groups (same as ROCm).
+        pass
 
     def _forward_bf16_kv(
         self,
@@ -260,13 +268,8 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
 
         num_actual_toks = q.shape[0]
 
-        buf = (
-            self._indexer.topk_indices_buffer
-            if self._indexer is not None
-            else self.topk_indices_buffer
-        )
-        assert buf is not None, "topk_indices_buffer required for sparse MLA"
-        topk_indices = buf[:num_actual_toks]
+        assert self.topk_indices_buffer is not None
+        topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
         kv_rows, block_stride_rows = flat_kv_row_view(
             kv_c_and_k_pe_cache, attn_metadata.block_size
@@ -277,11 +280,8 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
             topk_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             BLOCK_STRIDE_ROWS=block_stride_rows,
-            # The buffer's own width, not the logical top-k. GLM-5.3-Flash's
-            # kpool indexer reserves `kpool - 1` extra slots for the in-progress
-            # pool tail and rounds the total up to the sparse-MLA 128-column
-            # tile (2048 -> 2176); the padding stays -1 and is masked. Models
-            # whose buffer is exactly topk_tokens wide are unaffected.
+            # The buffer's own width: the GLM-5.3 kpool indexer pads it past
+            # the logical top-k with -1 columns, which the kernels mask.
             NUM_TOPK_TOKENS=topk_indices.shape[1],
         )
 

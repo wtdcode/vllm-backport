@@ -2,12 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A Marlin workspace must survive being reused across calls.
 
-`MarlinExperts` now allocates one workspace and passes it to every expert
-call, instead of running a `torch.zeros` per call. That is only correct if the
+The Marlin expert path reuses one persistent workspace (`get_marlin_workspace`)
+instead of running a `torch.zeros` per call. That is only correct if the
 kernel leaves the workspace in a reusable state -- it is a per-SM lock/counter
-array, and every Marlin *linear* layer already depends on this (they allocate
-in `process_weights_after_loading` and reuse forever), but the expert path
-never did, so nothing in the suite covered it.
+array that every Marlin linear layer and expert call now shares.
 
 The failure this guards against is not a crash: a stale lock array corrupts
 intermittently, on some later call, which is exactly the kind of thing that

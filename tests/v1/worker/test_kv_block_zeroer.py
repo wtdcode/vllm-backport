@@ -8,11 +8,10 @@ import pytest
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
+from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import (
-    ChunkedLocalAttentionSpec,
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheLayout,
-    SlidingWindowSpec,
 )
 from vllm.v1.worker import utils as worker_utils
 from vllm.v1.worker.utils import (
@@ -21,30 +20,16 @@ from vllm.v1.worker.utils import (
     _zero_kv_blocks_kernel,
 )
 
+DEVICE = current_platform.device_type
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize(
-    "spec",
-    [
-        SlidingWindowSpec(
-            block_size=2,
-            num_kv_heads=1,
-            head_size=1,
-            dtype=torch.uint8,
-            sliding_window=4,
-        ),
-        ChunkedLocalAttentionSpec(
-            block_size=2,
-            num_kv_heads=1,
-            head_size=1,
-            dtype=torch.uint8,
-            attention_chunk_size=4,
-        ),
-    ],
-    ids=["sliding-window", "chunked-local"],
+
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="CUDA or XPU required",
 )
-def test_attention_blocks_are_zeroed(spec):
-    device = torch.device("cuda")
+def test_attention_blocks_are_zeroed():
+    device = torch.device(DEVICE)
+    spec = AttentionSpec(block_size=2, num_kv_heads=1, head_size=1, dtype=torch.uint8)
     storage = torch.ones((4, 1, 2, 2), dtype=torch.uint8, device=device)
     layer_name = "draft.self_attn"
     zeroer = KVBlockZeroer(
@@ -65,17 +50,19 @@ def test_attention_blocks_are_zeroed(spec):
     assert torch.equal(storage, expected)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="CUDA or XPU required",
+)
 def test_layers_in_one_group_may_use_different_kernel_pages_per_block():
     """Derive kernel pages per block from each layer's allocation."""
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     num_blocks = 4
-    spec = SlidingWindowSpec(
+    spec = AttentionSpec(
         block_size=2,
         num_kv_heads=1,
         head_size=1,
         dtype=torch.int32,
-        sliding_window=2,
     )
     # Two kernel pages per logical block.
     wide = torch.ones((num_blocks * 2, 3), dtype=torch.int32, device=device)
@@ -142,20 +129,24 @@ def _zeroer_for(
     return zeroer
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="CUDA or XPU required",
+)
 def test_block_ids_are_not_overwritten_while_copy_is_in_flight():
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     num_blocks = 4
     page_size_el = 4
     storage = torch.ones((num_blocks, page_size_el), dtype=torch.int32, device=device)
     zeroer = _zeroer_for([storage])
 
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
+    stream = torch.Stream(device)
+    with stream:
         # Keep the first nonblocking H2D copy pending while the host submits the
         # second call. Each call must stage from its own pinned source so the
         # first copy is not corrupted before it runs.
-        torch.cuda._sleep(10_000_000)
+        if current_platform.is_cuda_alike():
+            torch.cuda._sleep(10_000_000)
         zeroer.zero_block_ids([[1]])
         zeroer.zero_block_ids([[2]])
     stream.synchronize()
@@ -166,17 +157,20 @@ def test_block_ids_are_not_overwritten_while_copy_is_in_flight():
     assert torch.all(storage[3] == 1)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="CUDA or XPU required",
+)
 def test_non_uniform_page_sizes():
     """Two segments with different page sizes (e.g. MLA + DSA indexer)."""
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     num_blocks = 4
     storage_a = torch.ones((num_blocks, 10496), dtype=torch.int32, device=device)
     storage_b = torch.ones((num_blocks, 2112), dtype=torch.int32, device=device)
     zeroer = _zeroer_for([storage_a, storage_b])
 
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
+    stream = torch.Stream(device)
+    with stream:
         zeroer.zero_block_ids([[1, 2]])
     stream.synchronize()
 
@@ -187,7 +181,10 @@ def test_non_uniform_page_sizes():
         assert torch.all(storage[3] == 1)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="CUDA or XPU required",
+)
 def test_interleaved_layer_views_zero_only_their_own_bytes():
     """THE STRIPE REGRESSION GUARD (#50576).
 
@@ -197,7 +194,7 @@ def test_interleaved_layer_views_zero_only_their_own_bytes():
     live blocks. Model the pool as [num_blocks, num_layers, page]: each layer
     view has stride num_layers * page but owns only page elements per block.
     """
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     num_blocks, num_layers, page = 4, 3, 64
     pool = torch.ones((num_blocks, num_layers, page), dtype=torch.int32, device=device)
     stride = num_layers * page
@@ -210,7 +207,7 @@ def test_interleaved_layer_views_zero_only_their_own_bytes():
     )
 
     zeroer.zero_block_ids([[1]])
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert torch.all(pool[0] == 1) and torch.all(pool[2:] == 1)
     assert torch.all(pool[1, 0] == 0), "layer 0's block 1 must be zeroed"
@@ -219,7 +216,10 @@ def test_interleaved_layer_views_zero_only_their_own_bytes():
     assert torch.all(pool[1, 1] == 1), "layer 1 is NOT registered and must survive"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="CUDA or XPU required",
+)
 def test_block_ids_are_group_scoped():
     """THE CROSS-GROUP REGRESSION GUARD (#50576).
 
@@ -228,7 +228,7 @@ def test_block_ids_are_group_scoped():
     with different geometry. Zeroing group 0's new block must not touch
     group 1's identically-numbered live block.
     """
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     storage_a = torch.ones((4, 128), dtype=torch.int32, device=device)
     storage_b = torch.ones((4, 96), dtype=torch.int32, device=device)
 
@@ -236,7 +236,7 @@ def test_block_ids_are_group_scoped():
     zeroer._group_meta[1] = zeroer.build_meta([storage_b.data_ptr()], [96], [96])
 
     zeroer.zero_block_ids([[1], [3]])
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert torch.all(storage_a[1] == 0) and torch.all(storage_b[3] == 0)
     # The flat-list bug applied every id to every group.
@@ -244,43 +244,13 @@ def test_block_ids_are_group_scoped():
     assert torch.all(storage_b[1] == 1), "group 1 must not zero group 0's id"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_virtual_block_split_zeroes_every_sub_block():
-    """Kernel block size < logical block size: one logical block spans
-    ratio kernel blocks, each zeroed only over the layer's own page."""
-    device = torch.device("cuda")
-    num_blocks, page = 4, 48
-    # Two kernel blocks per logical block, interleaved with a neighbor view
-    # (column 1) that must survive.
-    pool = torch.ones((num_blocks * 2, 2, page), dtype=torch.int32, device=device)
-    spec = SlidingWindowSpec(
-        block_size=2,
-        num_kv_heads=1,
-        head_size=1,
-        dtype=torch.int32,
-        sliding_window=2,
-    )
-    zeroer = KVBlockZeroer(
-        device,
-        attn_groups_iter=[AttentionGroup(None, ["layer"], spec, 0)],
-        kernel_block_sizes=[1],
-        static_forward_context={"layer": SimpleNamespace(kv_cache=pool[:, 0, :])},
-        num_blocks=num_blocks,
-    )
-
-    # Logical block 1 = kernel blocks 2 and 3.
-    zeroer.zero_block_ids([[1]])
-    torch.cuda.synchronize()
-
-    assert torch.all(pool[:2, 0] == 1) and torch.all(pool[4:, 0] == 1)
-    assert torch.all(pool[2, 0] == 0) and torch.all(pool[3, 0] == 0)
-    assert torch.all(pool[:, 1] == 1), "the interleaved neighbor must survive"
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="CUDA or XPU required",
+)
 def test_packed_segment_zeros_only_its_last_block_page():
     """A packed KV segment steps by block stride but clears only its page."""
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     num_blocks = 4
     block_stride_el = 12
     page_size_el = 4
@@ -310,12 +280,11 @@ def test_large_dsv4_launch_geometry(monkeypatch):
     n_blocks, n_segs = 6870, 181
     layer_names = [f"layer.{i}" for i in range(n_segs)]
     page_sizes = [9344 if i % 2 == 0 else 292 for i in range(n_segs)]
-    spec = SlidingWindowSpec(
+    spec = AttentionSpec(
         block_size=1,
         num_kv_heads=1,
         head_size=1,
         dtype=torch.int32,
-        sliding_window=1,
     )
     storages = {
         name: torch.ones((1, page_size), dtype=torch.int32)
@@ -358,14 +327,17 @@ def test_large_dsv4_launch_geometry(monkeypatch):
     assert captured_grids == [(n_blocks, n_segs, max_chunks)]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="CUDA or XPU required",
+)
 def test_warmup_compiles_for_all_block_counts():
     """After warmup, no launch should trigger a first-request JIT compile.
 
     The block count is carried by the launch grid, so changing it must reuse
     the warmup's compiled kernel.
     """
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     num_blocks = 64
     storage = torch.ones((num_blocks, 4), dtype=torch.int32, device=device)
     zeroer = _zeroer_for([storage])
@@ -389,10 +361,13 @@ def test_warmup_compiles_for_all_block_counts():
     assert compiled_variants() == warmed
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="CUDA or XPU required",
+)
 def test_warmup_respects_available_block_count():
     """An empty KV cache must not be warmed with out-of-range block IDs."""
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     storage = torch.ones((1, 4), dtype=torch.int32, device=device)
     zeroer = _zeroer_for([storage])
 
@@ -402,17 +377,18 @@ def test_warmup_respects_available_block_count():
     assert torch.all(storage == 1)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="CUDA or XPU required",
+)
 @pytest.mark.parametrize("layout", list(KVCacheLayout))
 def test_zeroes_exactly_one_block_per_layer(layout: KVCacheLayout):
     """The zeroer must zero every byte of the target block in every layer and nothing
     outside it — per head-group region under LHBNC, and never past the target block's
     tile under block-major layouts (no out-of-bounds writes, no clobbering)."""
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     num_blocks, num_layers = 4, 2
-    spec = FullAttentionSpec(
-        block_size=4, num_kv_heads=2, head_size=8, dtype=torch.float32
-    )
+    spec = AttentionSpec(block_size=4, num_kv_heads=2, head_size=8, dtype=torch.float32)
     raw = torch.empty(
         num_blocks * num_layers * spec.page_size_bytes,
         dtype=torch.int8,

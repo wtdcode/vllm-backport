@@ -53,6 +53,7 @@ def _stub(device: str = "cuda"):
     stub.compressor = compressor
     stub.indexer = indexer
     stub.hidden_size = HIDDEN
+    stub._fuse_input_gemms = True
     stub.fused_input_weight = None
     stub.fused_input_splits = []
     return stub
@@ -96,6 +97,22 @@ def test_fuse_input_gemm_weights_preserves_values_and_layout():
     for original, part in zip(originals, fused_out):
         reference = torch.mm(x, original.T, out_dtype=torch.float32)
         torch.testing.assert_close(part, reference, rtol=1e-5, atol=1e-5)
+
+
+def test_fuse_input_gemm_weights_refills_in_place_on_reload():
+    """Captured CUDA graphs hold the merged buffer's address, so a post-load
+    rerun (weight reload) must refill it rather than reallocate."""
+    stub = _stub()
+    DeepseekV4Attention.fuse_input_gemm_weights(stub)
+    merged_ptr = stub.fused_input_weight.data_ptr()
+
+    reloaded = torch.randn_like(stub.indexer.weights_proj.weight)
+    stub.indexer.weights_proj.weight.data.copy_(reloaded)
+    DeepseekV4Attention.fuse_input_gemm_weights(stub)
+
+    assert stub.fused_input_weight.data_ptr() == merged_ptr
+    assert torch.equal(stub.fused_input_weight[N_COMP + N_IDX :], reloaded)
+    assert torch.equal(stub.indexer.weights_proj.weight, reloaded)
 
 
 def test_fuse_input_gemm_weights_skips_layers_without_an_indexer():

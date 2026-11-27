@@ -4,109 +4,75 @@ import contextlib
 import ctypes
 import errno
 import fcntl
+import functools
 import json
 import mmap
 import os
 import platform
+import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from ctypes import c_int, c_long, c_size_t, c_void_p
 
 import numpy as np
 import torch
 
+from vllm.distributed.device_communicators.shm_broadcast import (
+    SHM_PATH,
+    check_shm_free_space,
+)
 from vllm.logger import init_logger
+from vllm.utils.host_memory import exclude_from_core_dump
+from vllm.utils.math_utils import cdiv, round_up
+from vllm.v1.kv_offload.cpu.host_register import host_unregister
 
 logger = init_logger(__name__)
 
 # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
-
-
-# Backing store for the shared region. "shm" (default) is a file in /dev/shm;
-# "memfd" is an anonymous memfd published to sibling processes through
-# /proc/<pid>/fd/<n>, which sidesteps a small /dev/shm (containers often cap it
-# well below RAM) -- the region is then bounded only by the memory cgroup.
+_MAP_FIXED = 0x10
+# Page-cache inserts are serialized per shm file, capping pre-faulting of one
+# file near 10 GiB/s; smaller segments are not worth a file.
+_MIN_SEGMENT_BYTES = 1 << 30
+# Split the shared region into this many shm files so workers pre-fault them
+# in parallel (page-cache inserts are serialized per file).
+REGION_SEGMENTS = 32
+_MADV_NOHUGEPAGE = getattr(mmap, "MADV_NOHUGEPAGE", 15)
+# Backing store of default-path regions. "shm" is a file in /dev/shm; "memfd"
+# is an anonymous memfd published to sibling processes via /proc/<pid>/fd/<n>,
+# which sidesteps a small /dev/shm: the region is then bounded only by the
+# memory cgroup, and the /dev/shm path is just a rendezvous marker.
 _REGION_BACKEND = os.environ.get("VLLM_KV_OFFLOAD_REGION_BACKEND", "shm")
-
-
-def _memfd_create(name: str) -> int:
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.memfd_create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
-    libc.memfd_create.restype = ctypes.c_int
-    fd = libc.memfd_create(name.encode(), 0)
-    if fd < 0:
-        err = ctypes.get_errno()
-        raise OSError(err, f"memfd_create failed: {os.strerror(err)}")
-    return fd
-
-
-def _reclaim_stale_memfd_markers(exclude_path: str) -> int:
-    """memfd regions die with their last fd holder, so only the rendezvous
-    marker in /dev/shm can leak; reap markers nobody holds a lock on."""
-    reclaimed = 0
-    try:
-        names = os.listdir("/dev/shm")
-    except OSError:
-        return 0
-    for name in names:
-        if not (name.startswith("vllm_offload_") and name.endswith(".memfd")):
-            continue
-        path = os.path.join("/dev/shm", name)
-        if path == exclude_path:
-            continue
-        try:
-            if time.time() - os.stat(path).st_mtime < 60.0:
-                continue
-            fd = os.open(path, os.O_RDWR)
-        except OSError:
-            continue
-        try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                continue
-            for q in (path, path + ".meta"):
-                with contextlib.suppress(OSError):
-                    os.unlink(q)
-            reclaimed += 1
-            logger.warning("Reclaimed stale KV offload memfd marker %s", path)
-        finally:
-            os.close(fd)
-    return reclaimed
+_STALE_REGION_GRACE_S = 60.0
+_MAX_UNREGISTER_ON_CLEANUP = 4096
 
 
 def _reclaim_stale_regions(exclude_path: str) -> int:
-    """Delete offload region files whose owning engine is gone.
+    """Delete default-path region files whose owning engine is gone.
 
-    Every process holds a shared flock on its region file for the file's
-    whole lifetime (taken right after open, fd kept open until cleanup),
-    and the kernel drops flocks automatically on process death --
-    including SIGKILL. A region file we can lock exclusively therefore
-    has no live owner. Without this reaper, every fail-fast boot crash
-    leaks its region into /dev/shm (engine ids are fresh per boot) until
-    the free-space precheck refuses to boot at all, turning a transient
-    crash into a permanent crash loop that restart policies cannot heal.
-
-    Files younger than 60s are skipped: a booting sibling engine's
-    workers open+lock their creator's file within moments, and the grace
-    period keeps the reaper away from that window. Regions created by
-    builds that predate flocking are indistinguishable from stale ones;
-    they are only safe to reap because deployments stop the old engine
-    before starting a new build.
+    Every process holds a shared flock on its region file (or memfd marker)
+    until cleanup, and the kernel drops flocks on process death, SIGKILL
+    included, so a file that can be locked exclusively has no live owner.
+    Without this, each crashed boot of a region that is not unlinked early
+    leaks into /dev/shm until the free-space check refuses to boot at all.
+    Files younger than the grace period are skipped: a booting sibling's
+    workers lock their creator's file within moments.
     """
     reclaimed = 0
     try:
-        names = os.listdir("/dev/shm")
+        names = os.listdir(SHM_PATH)
     except OSError:
         return 0
     for name in names:
-        if not (name.startswith("vllm_offload_") and name.endswith(".mmap")):
+        if not name.startswith("vllm_offload_"):
             continue
-        path = os.path.join("/dev/shm", name)
+        if not name.endswith((".mmap", ".memfd")):
+            continue
+        path = os.path.join(SHM_PATH, name)
         if path == exclude_path:
             continue
         try:
-            if time.time() - os.stat(path).st_mtime < 60.0:
+            if time.time() - os.stat(path).st_mtime < _STALE_REGION_GRACE_S:
                 continue
             fd = os.open(path, os.O_RDWR)
         except OSError:
@@ -115,10 +81,16 @@ def _reclaim_stale_regions(exclude_path: str) -> int:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
-                continue  # lock held -> a live engine owns this region
-            for p in (path, path + ".meta"):
+                continue  # lock held: a live engine owns this region
+            segments = [
+                os.path.join(SHM_PATH, other)
+                for other in names
+                if other.startswith(name + ".")
+                and (other == name + ".meta" or other[len(name) + 1 :].isdigit())
+            ]
+            for stale in (path, *segments):
                 with contextlib.suppress(OSError):
-                    os.unlink(p)
+                    os.unlink(stale)
             reclaimed += 1
             logger.warning(
                 "Reclaimed stale KV offload region %s (no live owner holds its lock)",
@@ -132,21 +104,16 @@ def _reclaim_stale_regions(exclude_path: str) -> int:
 def _interleave_across_numa_nodes(mm: mmap.mmap, length: int) -> None:
     """mbind(MPOL_INTERLEAVE) the region across all online NUMA nodes.
 
-    Under the kernel's default first-touch policy every populated page
-    lands on the toucher's node, and all workers run next to their GPUs
-    on one socket. A region approaching that node's capacity starves it:
-    observed on a 2-node 2 TB box, 888 GiB of a 1 TiB region landed on
-    node0 (1009 GiB), leaving ~10 GiB free there, and the driver's
-    node-local allocations during cudaHostRegister then failed with
-    cudaErrorMemoryAllocation - a boot crash loop. Interleaving spreads
-    the footprint evenly; remote-socket DMA is slower but this is a
-    staging tier. Must run BEFORE population: mbind only affects pages
-    that are not yet allocated.
+    Under first-touch every populated page lands on the toucher's node, and
+    all workers run next to their GPUs on one socket, so a region approaching
+    that node's capacity starves it and the driver's node-local allocations in
+    cudaHostRegister then fail. `VLLM_KV_OFFLOAD_NUMA_INTERLEAVE`: "auto"
+    (default) interleaves only regions of at least half the smallest node,
+    "1" always, "0" never. Must run before population: mbind only affects
+    pages that are not allocated yet.
     """
     knob = os.environ.get("VLLM_KV_OFFLOAD_NUMA_INTERLEAVE", "auto")
-    if knob == "0":
-        return
-    if platform.machine() != "x86_64":
+    if knob == "0" or platform.machine() != "x86_64":
         return
     try:
         with open("/sys/devices/system/node/online") as f:
@@ -163,10 +130,8 @@ def _interleave_across_numa_nodes(mm: mmap.mmap, length: int) -> None:
     if len(nodes) < 2 or max(nodes) >= 64:
         return
     if knob != "1":
-        # auto: interleave ONLY when the region is big enough to threaten a
-        # single node. Small regions are better off with first-touch - each
-        # rank's slots land on its GPU-local node and transfers stay on-socket.
-        # Threshold: half the smallest node's capacity.
+        # Small regions are better off with first-touch: each rank's slots
+        # land on its GPU-local node and transfers stay on-socket.
         min_node_bytes = None
         for n in nodes:
             try:
@@ -180,28 +145,20 @@ def _interleave_across_numa_nodes(mm: mmap.mmap, length: int) -> None:
             except OSError:
                 return
         if min_node_bytes is None or length < min_node_bytes // 2:
-            logger.info(
-                "Offload region (%.0f GB) fits comfortably in one NUMA node; "
-                "keeping first-touch placement for transfer locality "
-                "(set VLLM_KV_OFFLOAD_NUMA_INTERLEAVE=1 to force interleave)",
-                length / 1e9,
-            )
             return
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc = ctypes.CDLL(None, use_errno=True)
     mask = 0
     for n in nodes:
         mask |= 1 << n
     nodemask = (ctypes.c_ulong * 1)(mask)
     buf = ctypes.c_char.from_buffer(mm)
     try:
-        addr = ctypes.addressof(buf)
-        _SYS_MBIND = 237  # x86_64
-        _MPOL_INTERLEAVE = 3
+        sys_mbind, mpol_interleave = 237, 3  # x86_64
         ret = libc.syscall(
-            _SYS_MBIND,
-            ctypes.c_void_p(addr),
-            ctypes.c_size_t(length),
-            ctypes.c_int(_MPOL_INTERLEAVE),
+            sys_mbind,
+            c_void_p(ctypes.addressof(buf)),
+            c_size_t(length),
+            c_int(mpol_interleave),
             nodemask,
             ctypes.c_ulong(max(nodes) + 2),
             ctypes.c_uint(0),
@@ -224,6 +181,10 @@ def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> N
     while True:
         if os.fstat(fd).st_size >= expected_size:
             return
+        if os.fstat(fd).st_nlink == 0:
+            raise RuntimeError(
+                "Shared offload region creator failed during initialization."
+            )
         if time.monotonic() > deadline:
             raise TimeoutError(
                 f"Timed out waiting for mmap file to reach {expected_size} bytes"
@@ -231,8 +192,41 @@ def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> N
         time.sleep(0.005)
 
 
+@functools.cache
+def _libc_mmap() -> Callable[..., int | None]:
+    mmap_fn = ctypes.CDLL(None, use_errno=True).mmap
+    mmap_fn.argtypes = [c_void_p, c_size_t, c_int, c_int, c_int, c_long]
+    mmap_fn.restype = c_void_p
+    return mmap_fn
+
+
 def _madvise_populate_write(mmap_obj: mmap.mmap, offset: int, length: int) -> None:
-    mmap_obj.madvise(_MADV_POPULATE_WRITE, offset, length)
+    try:
+        mmap_obj.madvise(_MADV_POPULATE_WRITE, offset, length)
+    except OSError as e:
+        # A full tmpfs makes MADV_POPULATE_WRITE fail with EFAULT ("Bad
+        # address"), which does not point at the cause. The error stays an
+        # OSError so callers' own handlers still apply (not every mapping is
+        # in /dev/shm). Every other errno is re-raised unchanged; EINVAL
+        # selects the per-page fallback.
+        if e.errno != errno.EFAULT:
+            raise
+        space = ""
+        with contextlib.suppress(OSError):
+            if os.path.isdir(SHM_PATH):
+                usage = shutil.disk_usage(SHM_PATH)
+                space = (
+                    f" (now {usage.free / (1 << 30):.2f} GiB free of "
+                    f"{usage.total / (1 << 30):.2f} GiB)"
+                )
+        raise OSError(
+            errno.EFAULT,
+            "Pre-faulting the mapping failed with EFAULT, most likely because "
+            f"the memory backing it ran out. If it is in {SHM_PATH}{space}, "
+            f"note that {SHM_PATH} is shared by every process that uses it, "
+            "including other data-parallel engines; increase its capacity or "
+            "reduce the host buffer size",
+        ) from e
 
 
 def _fallback_populate_write(mmap_obj: mmap.mmap, offset: int, length: int) -> None:
@@ -260,22 +254,48 @@ def _get_populate_write_fn(
     return _madvise_populate_write
 
 
+@functools.cache
+def _libc_madvise() -> Callable[[int, int, int], int]:
+    # Called through ctypes, so the GIL is released while pages fault in.
+    madvise_fn = ctypes.CDLL(None, use_errno=True).madvise
+    madvise_fn.argtypes = [c_void_p, c_size_t, c_int]
+    madvise_fn.restype = c_int
+    return madvise_fn
+
+
 class SharedOffloadRegion:
-    """
-    Single mmap-backed memory region shared across all workers for a
+    """Single mmap-backed memory region shared across all workers for a
     vLLM instance.  Workers coordinate via the filesystem: the first worker
     to open the file with O_EXCL becomes the creator and calls ftruncate;
     the rest open the existing file and wait until it reaches the expected
     size.  Each worker then mmap()s the full file.
 
-    File path: /dev/shm/vllm_offload_{engine_id}.mmap.  When a barrier is
-    given, the path is unlinked once every worker has mapped the file, so
-    the kernel reclaims the memory when the last worker exits, no matter
-    how it exits; mappings taken before the unlink stay valid.
+    File path: `mmap_path` if given, and `engine_id` is then unused;
+    otherwise /dev/shm/vllm_offload_{engine_id}.mmap.  Further segment files
+    add a `.{i}` suffix.  When a barrier is given, the path is unlinked once
+    every worker has mapped the file, so the kernel reclaims the memory when
+    the last worker exits, no matter how it exits; mappings taken before the
+    unlink stay valid.
 
-    With VLLM_KV_OFFLOAD_REGION_BACKEND=memfd the region is an anonymous
-    memfd published through /proc/<pid>/fd/<n>; the /dev/shm path is then
-    only a small rendezvous marker.
+    Regions opened at the same `mmap_path` share its files.  The caller owns
+    files at a custom path: pass no barrier to keep them for later openers.
+
+    `populate_shard=(index, count)` pre-faults only this worker's contiguous
+    share, for layouts where every worker maps the same bytes. The barrier
+    also waits for all shards to finish pre-faulting before returning.
+    `num_segments` splits backing files beneath the contiguous mapping.
+    `populate=False` skips pre-faulting, for a mapper whose peers pre-fault
+    every page or that calls prefault() later.
+
+    `private=True` declares that no peer maps this file: it takes no barrier
+    and the path is unlinked as soon as this worker has mapped it.
+
+    Default-path regions additionally hold a shared flock for their lifetime
+    so a later boot can reap files leaked by a killed engine, and a shared one
+    publishes its geometry to `<path>.meta` for joiners to verify (pipeline
+    stages computing different geometries would otherwise overlap silently).
+    With `VLLM_KV_OFFLOAD_REGION_BACKEND=memfd` they are backed by one
+    anonymous memfd, with the path only a rendezvous marker.
     """
 
     BLOCK_SIZE_ALIGNMENT: int = mmap.PAGESIZE
@@ -288,24 +308,54 @@ class SharedOffloadRegion:
         kv_bytes_per_chunk: int,
         cpu_page_size: int,
         barrier: Callable[[], None] | None = None,
+        *,
+        creator_memory_check: Callable[[int], None] | None = None,
+        populate_shard: tuple[int, int] | None = None,
+        num_segments: int = 1,
+        private: bool = False,
+        populate: bool = True,
+        mmap_path: str | None = None,
     ) -> None:
+        assert not private or (barrier is None and populate_shard is None)
         self.page_size = mmap.PAGESIZE
         assert kv_bytes_per_chunk % self.page_size == 0
 
         self.num_chunks = num_chunks
         self._row_stride = kv_bytes_per_chunk
         self.total_size_bytes = self.num_chunks * self._row_stride
+        self.cpu_page_size = cpu_page_size
 
-        self.backend = _REGION_BACKEND
+        self._default_path = mmap_path is None
+        self.backend = _REGION_BACKEND if self._default_path else "shm"
         if self.backend not in ("shm", "memfd"):
             raise ValueError(
                 f"VLLM_KV_OFFLOAD_REGION_BACKEND={self.backend!r}; use shm or memfd"
             )
         suffix = "memfd" if self.backend == "memfd" else "mmap"
-        # For memfd this is only the rendezvous marker (a few bytes); the
-        # region itself is anonymous memory reachable via meta["memfd"].
-        self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.{suffix}"
+        self.mmap_path = mmap_path or os.path.join(
+            SHM_PATH, f"vllm_offload_{engine_id}.{suffix}"
+        )
+        self._meta_path = (
+            f"{self.mmap_path}.meta" if self._default_path and not private else None
+        )
+        self._meta_published = False
         self._marker_fd: int | None = None
+        if self.backend == "memfd":
+            num_segments = 1
+        num_segments = min(num_segments, self.total_size_bytes // _MIN_SEGMENT_BYTES)
+        alignment = 2 << 20 if num_chunks == 1 else self._row_stride
+        segment_bytes = round_up(
+            cdiv(self.total_size_bytes, max(1, num_segments)), alignment
+        )
+        # (path, offset, length) per file.
+        self._segments = [
+            (
+                f"{self.mmap_path}.{i}" if i else self.mmap_path,
+                offset,
+                min(segment_bytes, self.total_size_bytes - offset),
+            )
+            for i, offset in enumerate(range(0, self.total_size_bytes, segment_bytes))
+        ]
         self._creator = False  # set True only if this worker creates the file
         self.rank = rank
         if rank is not None:
@@ -313,254 +363,104 @@ class SharedOffloadRegion:
             self._worker_offset = rank * cpu_page_size
             # exclusive upper bound for this worker's area within each row
             self._worker_area_end = (rank + 1) * cpu_page_size
+        barriers_remaining = 2 if populate_shard is not None else 1
         self.fd: int | None = None
-        self.mmap_obj: mmap.mmap | None = None
         try:
             if self.backend == "memfd":
-                self._init_memfd(engine_id)
+                self._open_memfd(engine_id, creator_memory_check)
             else:
-                self._init_shm()
-            self.mmap_obj = mmap.mmap(
-                self.fd,
-                self.total_size_bytes,
-                flags=mmap.MAP_SHARED,
-                prot=mmap.PROT_READ | mmap.PROT_WRITE,
-            )
-        except Exception:
-            self._unlink_if_creator()
-            self._close_fds()
-            # Peers block inside the barrier until the collective times out if
-            # we die before reaching it.  Arrive anyway so every worker calls
-            # barrier() exactly once and they fail on their own errors instead
-            # of hanging; a failure here must not replace ours.
-            if barrier is not None:
+                self._open_shm(creator_memory_check)
+
+            single = len(self._segments) == 1
+            self.mmap_obj: mmap.mmap | None = None
+            if single:
+                self.mmap_obj = mmap.mmap(
+                    self.fd,
+                    self.total_size_bytes,
+                    flags=mmap.MAP_SHARED,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                )
+            else:
+                reservation = os.memfd_create("vllm_offload_reservation")
                 try:
-                    barrier()
-                except Exception:
-                    logger.warning(
-                        "Failed to release peers waiting at the mmap barrier",
-                        exc_info=True,
+                    os.ftruncate(reservation, self.total_size_bytes)
+                    self.mmap_obj = mmap.mmap(
+                        reservation,
+                        self.total_size_bytes,
+                        flags=mmap.MAP_SHARED,
+                        prot=mmap.PROT_READ | mmap.PROT_WRITE,
                     )
+                finally:
+                    os.close(reservation)
+                self._map_segments()
+            exclude_from_core_dump(self.mmap_obj)
+            # khugepaged can collapse pages across two ranks' slots, making
+            # their per-slot host registrations overlap physically.
+            with contextlib.suppress(OSError):
+                self.mmap_obj.madvise(_MADV_NOHUGEPAGE)
+            _interleave_across_numa_nodes(self.mmap_obj, self.total_size_bytes)
+            if private and self._creator:
+                self._unlink()
+                self._creator = False
+            if barrier is not None:
+                barriers_remaining -= 1
+                barrier()
+                if self._creator:
+                    self._unlink()
+                    self._creator = False
+                    logger.info("Unlinked mmap file %s", self.mmap_path)
+            if populate_shard is not None:
+                populate_write_fn = _get_populate_write_fn(self.mmap_obj)
+                index, count = populate_shard
+                share = round_up(cdiv(self.total_size_bytes, count), self.page_size)
+                start = min(index * share, self.total_size_bytes)
+                if start < self.total_size_bytes:
+                    length = min(share, self.total_size_bytes - start)
+                    populate_write_fn(self.mmap_obj, start, length)
+                if barrier is not None:
+                    barriers_remaining -= 1
+                    barrier()
+        except Exception:
+            if self._creator:
+                self._unlink()
+                self._creator = False
+            if hasattr(self, "mmap_obj") and self.mmap_obj is not None:
+                # The prefault traceback may retain an exported buffer.
+                with contextlib.suppress(BufferError):
+                    self.mmap_obj.close()
+                self.mmap_obj = None
+            if self.fd is not None:
+                os.close(self.fd)
+                self.fd = None
+            self._close_marker()
+            # Join remaining barriers so peers do not wait until the collective
+            # times out. A barrier failure must not replace the setup error.
+            if barrier is not None:
+                for _ in range(barriers_remaining):
+                    try:
+                        barrier()
+                    except Exception:
+                        logger.warning(
+                            "Failed to release peers waiting at the mmap barrier",
+                            exc_info=True,
+                        )
             raise
 
-        if barrier is not None:
-            # Every worker has mapped the file once the barrier releases, so
-            # its name is no longer needed and dropping it here means no exit
-            # path — including SIGKILL — can leak the file.
-            try:
-                barrier()
-            except Exception:
-                self._unlink_if_creator()
-                self.mmap_obj.close()
-                self._close_fds()
-                raise
-            if self._creator:
-                self._unlink_if_creator()
-                logger.info("Unlinked mmap file %s", self.mmap_path)
+        self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
+        self._views: list[torch.Tensor] = []
+        self._canonical_offset = 0
+        self.is_pinned: bool = False
+        self.pinned_addresses: list[int] = []
 
-        self._map_and_populate(rank, num_chunks, cpu_page_size)
-
-    def _unlink_if_creator(self) -> None:
-        if not self._creator:
+        if populate_shard is not None or not populate:
             return
-        for path in (self.mmap_path, self.mmap_path + ".meta"):
-            with contextlib.suppress(OSError):
-                os.unlink(path)
-        self._creator = False
-
-    def _close_fds(self) -> None:
-        for attr in ("fd", "_marker_fd"):
-            fd = getattr(self, attr)
-            if fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
-                setattr(self, attr, None)
-
-    def _init_memfd(self, engine_id: str) -> None:
-        meta_path = self.mmap_path + ".meta"
-        try:
-            self._marker_fd = os.open(
-                self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
-            )
-            # We own the marker from here on: any failure below must unlink it
-            # (see __init__) so joiners do not spin on a stub for 30 s.
-            self._creator = True
-            fcntl.flock(self._marker_fd, fcntl.LOCK_SH)
-            _reclaim_stale_memfd_markers(self.mmap_path)
-            self.fd = _memfd_create(f"vllm_offload_{engine_id}")
-            os.ftruncate(self.fd, self.total_size_bytes)
-            meta_tmp = meta_path + ".tmp"
-            with open(meta_tmp, "w") as f:
-                json.dump(
-                    {
-                        "num_chunks": self.num_chunks,
-                        "row_stride": self._row_stride,
-                        "total_size_bytes": self.total_size_bytes,
-                        "memfd": f"/proc/{os.getpid()}/fd/{self.fd}",
-                    },
-                    f,
-                )
-            os.replace(meta_tmp, meta_path)
-            logger.info(
-                "Created memfd offload region %s (%.2f GB), marker %s",
-                f"/proc/{os.getpid()}/fd/{self.fd}",
-                self.total_size_bytes / 1e9,
-                self.mmap_path,
-            )
-        except FileExistsError:
-            self._marker_fd = os.open(self.mmap_path, os.O_RDWR)
-            fcntl.flock(self._marker_fd, fcntl.LOCK_SH)
-            meta = self._wait_for_meta(meta_path)
-            memfd_path = meta.pop("memfd", None)
-            self._check_geometry(meta)
-            if not memfd_path:
-                raise RuntimeError(f"{meta_path} carries no memfd path") from None
-            deadline = time.monotonic() + 30.0
-            while True:
-                try:
-                    self.fd = os.open(memfd_path, os.O_RDWR)
-                    break
-                except OSError as e:
-                    if time.monotonic() > deadline:
-                        raise TimeoutError(
-                            f"Cannot open the creator's memfd {memfd_path}: {e}"
-                        ) from e
-                    time.sleep(0.05)
-            _wait_for_file_size(self.fd, self.total_size_bytes)
-            logger.info("Opened existing memfd offload region %s", memfd_path)
-
-    def _wait_for_meta(self, meta_path: str) -> dict:
-        deadline = time.monotonic() + 30.0
-        while not os.path.exists(meta_path):
-            if time.monotonic() > deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for {meta_path}; the region "
-                    "creator did not publish its geometry."
-                )
-            time.sleep(0.05)
-        with open(meta_path) as f:
-            return json.load(f)
-
-    def _check_geometry(self, meta: dict) -> None:
-        expected = {
-            "num_chunks": self.num_chunks,
-            "row_stride": self._row_stride,
-            "total_size_bytes": self.total_size_bytes,
-        }
-        if meta != expected:
-            raise RuntimeError(
-                "Shared KV offload region geometry mismatch: creator "
-                f"published {meta} but this process computed {expected}. "
-                "All workers and the scheduler must derive one geometry "
-                "(see KVCacheConfig.max_worker_kv_bytes_per_block); with "
-                "pipeline parallelism a per-stage mismatch here would "
-                "silently corrupt offloaded KV."
-            )
-
-    def _init_shm(self) -> None:
-        try:
-            # Exclusive create — only one worker succeeds
-            self.fd = os.open(self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-            # We won O_EXCL, so we own the file: any failure below must unlink
-            # it (see __init__) so concurrent joiners don't land on a 0-byte
-            # stub and spin in _wait_for_file_size for the full 30 s timeout.
-            self._creator = True
-            # Advertise liveness: hold a shared lock on the region file for
-            # as long as this process lives (fd stays open until cleanup).
-            # The reaper below only deletes region files nobody holds a
-            # lock on, so this is what protects OUR region from a sibling
-            # engine's reaper.
-            fcntl.flock(self.fd, fcntl.LOCK_SH)
-            # Reap regions leaked by dead engines (fail-fast crashes are
-            # SIGKILLed and cannot clean up after themselves) BEFORE the
-            # free-space check, so a crash loop frees its own garbage and
-            # the restart policy can actually self-heal.
-            _reclaim_stale_regions(self.mmap_path)
-            # Fail fast with an actionable message if /dev/shm cannot hold the
-            # region. Otherwise page allocation fails later as an inscrutable
-            # EFAULT/SIGBUS. Stale regions from SIGKILLed engines (e.g.
-            # docker force-recreate) are the usual culprit.
-            vfs = os.statvfs("/dev/shm")
-            free = vfs.f_bavail * vfs.f_frsize
-            if free < self.total_size_bytes:
-                stale = [
-                    f
-                    for f in os.listdir("/dev/shm")
-                    if f.startswith("vllm_offload_")
-                    and f != os.path.basename(self.mmap_path)
-                ]
-                raise RuntimeError(
-                    f"/dev/shm has {free / 1e9:.1f} GB free but the KV offload "
-                    f"region needs {self.total_size_bytes / 1e9:.1f} GB "
-                    "(after reaping stale regions). Other offload regions "
-                    f"present: {stale or 'none'} - these are live (lock held) "
-                    "or too young to reap. Free /dev/shm space, increase its "
-                    "size, or set VLLM_KV_OFFLOAD_REGION_BACKEND=memfd."
-                )
-            os.ftruncate(self.fd, self.total_size_bytes)
-            # Publish the region geometry so late-joining processes can verify
-            # they agree. PP stages computing different geometries used to
-            # race on this file: the loser waited forever for a size the
-            # winner never set, or worse, mapped overlapping incompatible
-            # layouts. Written atomically so openers never see a partial file.
-            meta_tmp = self.mmap_path + ".meta.tmp"
-            with open(meta_tmp, "w") as f:
-                json.dump(
-                    {
-                        "num_chunks": self.num_chunks,
-                        "row_stride": self._row_stride,
-                        "total_size_bytes": self.total_size_bytes,
-                    },
-                    f,
-                )
-            os.replace(meta_tmp, self.mmap_path + ".meta")
-            logger.info(
-                "Created mmap file %s (%.2f GB)",
-                self.mmap_path,
-                self.total_size_bytes / 1e9,
-            )
-        except FileExistsError:
-            self.fd = os.open(self.mmap_path, os.O_RDWR)
-            # Same liveness lock as the creator: joiners keep the region
-            # alive too (the creator process alone may die first).
-            fcntl.flock(self.fd, fcntl.LOCK_SH)
-            self._check_geometry(self._wait_for_meta(self.mmap_path + ".meta"))
-            _wait_for_file_size(self.fd, self.total_size_bytes)
-            logger.info("Opened existing mmap file %s", self.mmap_path)
-
-    def _map_and_populate(
-        self, rank: int | None, num_chunks: int, cpu_page_size: int
-    ) -> None:
-        assert self.mmap_obj is not None
-        # Forbid transparent huge pages on this mapping. khugepaged collapses
-        # neighbouring 4K pages into 2M pages asynchronously; a huge page
-        # spanning two ranks' slot boundaries makes their per-slot
-        # cudaHostRegister ranges overlap at the physical-page level, and the
-        # cross-process pin/DMA-map churn during early warmup surfaces as a
-        # probabilistic async cudaErrorInvalidValue (boot-time crash race).
-        _MADV_NOHUGEPAGE = getattr(mmap, "MADV_NOHUGEPAGE", 15)
-        try:
-            self.mmap_obj.madvise(_MADV_NOHUGEPAGE)
-        except OSError:
-            logger.warning("MADV_NOHUGEPAGE not supported; leaving THP enabled")
-
-        # Spread a near-node-sized region across NUMA nodes before any page
-        # is touched (fork feature; auto-gated inside).
-        _interleave_across_numa_nodes(self.mmap_obj, self.total_size_bytes)
-
         populate_write_fn = _get_populate_write_fn(self.mmap_obj)
 
         if rank is not None:
             # Populate only this worker's pages (one slot per chunk row).
-            worker_offset = rank * cpu_page_size
             _t0 = time.perf_counter()
-            page_size = self.page_size
-            for chunk in range(num_chunks):
-                raw_offset = chunk * self._row_stride + worker_offset
-                aligned_offset = (raw_offset // page_size) * page_size
-                end = raw_offset + cpu_page_size
-                aligned_length = end - aligned_offset
-                populate_write_fn(self.mmap_obj, aligned_offset, aligned_length)
+            for offset, length in self.iter_worker_slot_ranges():
+                populate_write_fn(self.mmap_obj, offset, length)
             logger.debug(
                 "MADV_POPULATE_WRITE loop: %d chunks in %.3f s",
                 num_chunks,
@@ -574,11 +474,237 @@ class SharedOffloadRegion:
                 "MADV_POPULATE_WRITE entire region: %.3f s", time.perf_counter() - _t0
             )
 
-        self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
-        self._views: list[torch.Tensor] = []
-        self._canonical_offset = 0
-        self.is_pinned: bool = False
-        self._pinned_slot_offsets: list[int] = []
+    def _open_shm(self, creator_memory_check: Callable[[int], None] | None) -> None:
+        try:
+            self.fd = os.open(self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        except FileExistsError:
+            # Joiner path — another worker won O_EXCL. Reopen and wait
+            # for the file to reach expected size.
+            self.fd = os.open(self.mmap_path, os.O_RDWR)
+            # Joiners keep the region alive too: the creator may die first.
+            self._hold_liveness_lock(self.fd)
+            self._check_geometry(self._wait_for_meta(self.fd))
+            _wait_for_file_size(self.fd, self._segments[0][2])
+            logger.info("Opened existing mmap file %s", self.mmap_path)
+        else:
+            # Creator path. We won O_EXCL, so we own the file: any
+            # failure here must clean up so concurrent joiners don't
+            # land on a 0-byte stub and spin in _wait_for_file_size
+            # for the full 30 s timeout.
+            self._creator = True
+            self._hold_liveness_lock(self.fd)
+            if self._default_path:
+                # Before the free-space check, so a crash loop frees its
+                # own garbage.
+                _reclaim_stale_regions(self.mmap_path)
+            if creator_memory_check is not None:
+                creator_memory_check(self.total_size_bytes)
+            region_dir = os.path.dirname(os.path.abspath(self.mmap_path))
+            check_shm_free_space(
+                self.total_size_bytes,
+                shm_path=region_dir,
+                allocation_name=f"CPU KV offload shared region in {region_dir}",
+            )
+            for path, _, length in self._segments[1:]:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                os.ftruncate(fd, length)
+                os.close(fd)
+            # Joiners wait for the first file, so size it last.
+            os.ftruncate(self.fd, self._segments[0][2])
+            self._publish_geometry()
+            logger.info(
+                "Created mmap file %s (%.2f GB)",
+                self.mmap_path,
+                self.total_size_bytes / 1e9,
+            )
+
+    def _open_memfd(
+        self, engine_id: str, creator_memory_check: Callable[[int], None] | None
+    ) -> None:
+        try:
+            self._marker_fd = os.open(
+                self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
+            )
+        except FileExistsError:
+            self._marker_fd = os.open(self.mmap_path, os.O_RDWR)
+            self._hold_liveness_lock(self._marker_fd)
+            meta = self._wait_for_meta(self._marker_fd)
+            if meta is None:
+                raise RuntimeError(
+                    f"Private region {self.mmap_path} already exists"
+                ) from None
+            memfd_path = meta.pop("memfd", None)
+            self._check_geometry(meta)
+            if not memfd_path:
+                raise RuntimeError(f"{self._meta_path} carries no memfd path") from None
+            deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    self.fd = os.open(memfd_path, os.O_RDWR)
+                    break
+                except OSError as e:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(
+                            f"Cannot open the creator's memfd {memfd_path}: {e}"
+                        ) from e
+                    time.sleep(0.05)
+            assert os.fstat(self.fd).st_size >= self.total_size_bytes
+            logger.info("Opened existing memfd offload region %s", memfd_path)
+        else:
+            # We own the marker: a failure below must unlink it (see __init__).
+            self._creator = True
+            self._hold_liveness_lock(self._marker_fd)
+            _reclaim_stale_regions(self.mmap_path)
+            if creator_memory_check is not None:
+                creator_memory_check(self.total_size_bytes)
+            self.fd = os.memfd_create(f"vllm_offload_{engine_id}")
+            os.ftruncate(self.fd, self.total_size_bytes)
+            memfd_path = f"/proc/{os.getpid()}/fd/{self.fd}"
+            self._publish_geometry(memfd=memfd_path)
+            logger.info(
+                "Created memfd offload region %s (%.2f GB), marker %s",
+                memfd_path,
+                self.total_size_bytes / 1e9,
+                self.mmap_path,
+            )
+
+    def _hold_liveness_lock(self, fd: int) -> None:
+        """Shared flock held until the fd closes; see _reclaim_stale_regions."""
+        if self._default_path:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_SH)
+
+    def _geometry(self) -> dict:
+        return {
+            "num_chunks": self.num_chunks,
+            "row_stride": self._row_stride,
+            "total_size_bytes": self.total_size_bytes,
+        }
+
+    def _publish_geometry(self, **extra: str) -> None:
+        """Atomically publish the creator's geometry for joiners to verify."""
+        if self._meta_path is None:
+            return
+        meta_tmp = f"{self._meta_path}.tmp"
+        with open(meta_tmp, "w") as f:
+            json.dump({**self._geometry(), **extra}, f)
+        os.replace(meta_tmp, self._meta_path)
+        self._meta_published = True
+
+    def _wait_for_meta(self, fd: int, timeout: float = 30.0) -> dict | None:
+        """The creator's published geometry; None for regions without one."""
+        if self._meta_path is None:
+            return None
+        deadline = time.monotonic() + timeout
+        while not os.path.exists(self._meta_path):
+            if os.fstat(fd).st_nlink == 0:
+                raise RuntimeError(
+                    "Shared offload region creator failed during initialization."
+                )
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for {self._meta_path}; the region "
+                    "creator did not publish its geometry."
+                )
+            time.sleep(0.005)
+        with open(self._meta_path) as f:
+            return json.load(f)
+
+    def _check_geometry(self, meta: dict | None) -> None:
+        expected = self._geometry()
+        if meta is not None and meta != expected:
+            raise RuntimeError(
+                "Shared KV offload region geometry mismatch: creator "
+                f"published {meta} but this process computed {expected}. "
+                "All workers and the scheduler must derive one geometry; "
+                "with pipeline parallelism a per-stage mismatch here would "
+                "silently corrupt offloaded KV."
+            )
+
+    def _close_marker(self) -> None:
+        if self._marker_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._marker_fd)
+            self._marker_fd = None
+
+    def _map_segments(self) -> None:
+        """Replace the anonymous mapping with the segment files, back to back."""
+        assert self.mmap_obj is not None and self.fd is not None
+        base = ctypes.addressof(ctypes.c_char.from_buffer(self.mmap_obj))
+        for path, offset, length in self._segments:
+            fd = self.fd if offset == 0 else os.open(path, os.O_RDWR)
+            address = _libc_mmap()(
+                base + offset,
+                length,
+                mmap.PROT_READ | mmap.PROT_WRITE,
+                mmap.MAP_SHARED | _MAP_FIXED,
+                fd,
+                0,
+            )
+            if fd != self.fd:
+                os.close(fd)
+            if address != base + offset:
+                raise OSError(ctypes.get_errno(), f"Failed to map {path}")
+
+    def _unlink(self) -> None:
+        paths = [path for path, _, _ in self._segments]
+        if self._meta_path is not None and self._meta_published:
+            paths.append(self._meta_path)
+        for path in paths:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+
+    def prefault_ranges(
+        self, shard: tuple[int, int] | None = None
+    ) -> list[tuple[int, int]]:
+        """Ranges a deferred pre-fault covers: this rank's slots, or the whole
+        region, which `shard=(index, count)` walks from that share onwards."""
+        if shard is not None:
+            # Workers that share every byte each pin the whole region, so each
+            # maps all of it first: a page pinned before it is mapped is faulted
+            # inside the registration call. Starting on its own share spreads
+            # the first allocation of the pages across the files.
+            index, count = shard
+            share = round_up(cdiv(self.total_size_bytes, count), self.page_size)
+            start = min(index * share, self.total_size_bytes)
+            return [(start, self.total_size_bytes - start), (0, start)]
+        if self.rank is not None:
+            return list(self.iter_worker_slot_ranges())
+        return [(0, self.total_size_bytes)]
+
+    def prefault(self, offset: int, length: int) -> None:
+        """Pre-fault a range without holding the GIL."""
+        addr = self._base.data_ptr() + offset
+        if _libc_madvise()(addr, length, _MADV_POPULATE_WRITE) == 0:
+            return
+        err = ctypes.get_errno()
+        if err != errno.EINVAL:
+            raise OSError(err, os.strerror(err))
+        assert self.mmap_obj is not None
+        _fallback_populate_write(self.mmap_obj, offset, length)
+
+    def iter_worker_slot_ranges(self) -> Iterator[tuple[int, int]]:
+        """Yield this worker's slots as page-aligned (offset, length) ranges."""
+        assert self.rank is not None
+        worker_offset = self.rank * self.cpu_page_size
+        first = 0
+        if len(self._segments) > 1:
+            # Start each worker on a different file.
+            first = (
+                self.rank * self.num_chunks // (self._row_stride // self.cpu_page_size)
+            )
+        for i in range(self.num_chunks):
+            row = (first + i) % self.num_chunks
+            start = row * self._row_stride + worker_offset
+            aligned = start - start % self.page_size
+            end = round_up(start + self.cpu_page_size, self.page_size)
+            yield aligned, end - aligned
+
+    @property
+    def base_tensor(self) -> torch.Tensor:
+        if self._base is None:
+            raise RuntimeError("Shared offload region has been released.")
+        return self._base
 
     def create_next_worker_view(self, tensor_page_size: int) -> torch.Tensor:
         """Allocate a strided int8 view for this worker, one canonical tensor.
@@ -601,6 +727,7 @@ class SharedOffloadRegion:
 
         Args:
             tensor_page_size: Bytes per chunk for this tensor.
+
         """
         assert self.rank is not None
         new_offset = self._worker_offset + tensor_page_size
@@ -650,6 +777,7 @@ class SharedOffloadRegion:
 
         Args:
             tensor_page_size: Canonical bytes per chunk for this tensor.
+
         """
         new_offset = self._canonical_offset + tensor_page_size
         assert new_offset <= self._row_stride
@@ -667,7 +795,7 @@ class SharedOffloadRegion:
         """Return a zero-copy memoryview over the entire KV buffer.
 
         Shape: (num_chunks, row_stride_bytes). Secondary tiers address
-        chunk *b* as ``view[b]``.
+        chunk *b* as `view[b]`.
         """
         kv_tensor = self._base.view(self.num_chunks, self._row_stride)
         np_arr = kv_tensor.numpy()
@@ -678,14 +806,16 @@ class SharedOffloadRegion:
         return memoryview(np_arr)
 
     def cleanup(self) -> None:
-        # Do NOT cudaHostUnregister here: with per-slot pinning that is tens
-        # of thousands of driver calls taking minutes, during which a crashed
-        # engine looks hung -- the container never exits, so the docker
-        # restart policy cannot self-heal a boot-time failure. The driver
-        # releases every pin automatically when the process exits, which is
-        # exactly where cleanup() runs.
         if self.is_pinned and self._base is not None:
-            self._pinned_slot_offsets = []
+            base_ptr = self._base.data_ptr()
+            addresses = self.pinned_addresses or [base_ptr]
+            # Per-slot pinning leaves one registration per chunk; unregistering
+            # tens of thousands takes minutes, during which a crashed engine
+            # looks hung. Leave those to process exit, which releases the pins.
+            if len(addresses) <= _MAX_UNREGISTER_ON_CLEANUP:
+                for address in reversed(addresses):
+                    host_unregister(address)
+            self.pinned_addresses.clear()
             self.is_pinned = False
         # Release views before _base: each view holds a _base reference and a
         # direct StorageImpl reference.  Freeing views first lets both refcounts
@@ -695,28 +825,32 @@ class SharedOffloadRegion:
             self._views.clear()
         self._base = None
         if self.mmap_obj:
+            retained = False
             try:
                 self.mmap_obj.close()
+            except BufferError:
+                # A native user still exports this mapping, so unmapping would
+                # let the NIC write into reused address space. Keep it mapped;
+                # dropping the fd and the pathname below is still safe.
+                retained = True
+                logger.warning(
+                    "Keeping %s mapped: buffers are still exported to native users",
+                    self.mmap_path,
+                )
             except Exception:
                 logger.warning("Failed to close mmap_obj", exc_info=True)
-            self.mmap_obj = None
+            if not retained:
+                self.mmap_obj = None
         if self.fd is not None:
             try:
                 os.close(self.fd)
             except Exception:
                 logger.warning("Failed to close fd %s", self.fd, exc_info=True)
             self.fd = None
-        if self._marker_fd is not None:
-            try:
-                os.close(self._marker_fd)
-            except Exception:
-                logger.warning("Failed to close marker fd", exc_info=True)
-            self._marker_fd = None
+        self._close_marker()
         if self._creator and getattr(self, "mmap_path", None):
             try:
-                os.unlink(self.mmap_path)
-                with contextlib.suppress(OSError):
-                    os.unlink(self.mmap_path + ".meta")
+                self._unlink()
                 logger.info("Removed mmap file %s", self.mmap_path)
             except Exception:
                 logger.warning(

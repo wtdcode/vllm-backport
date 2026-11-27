@@ -18,8 +18,9 @@ Each case runs the kernel repeatedly on identical input and asserts:
 
 Scenarios: `zeros-tie` (boundary inside an exact-0.0 mass), `dup-vals`
 (small value alphabet, ties everywhere), `unique` (all-distinct values).
-Lengths cover the decode dispatch tiers: histogram_2048 (<=8192),
-histogram_256 medium (<=32768), and the multi-CTA radix path (>32768).
+Single-row lengths cover the register histogram (<=32768) and the multi-CTA
+radix path (>32768); the batched cases cover the persistent short/medium
+rescan, FilteredTopK long rows and sampled top-k.
 """
 
 import pytest
@@ -136,6 +137,39 @@ def test_persistent_topk_mixed_lengths_batch():
         got = frozenset(x for x in first[r].tolist() if x >= 0)
         expected = _reference_set(logits[r, :ln], min(K, ln))
         assert got == expected, f"row {r} (len {ln}) selected a wrong set"
+    for _ in range(ITERS - 1):
+        again = _run_persistent(logits, lengths, K, n_max)
+        assert torch.equal(again, first), "batch output differs between runs"
+
+
+@requires_cuda
+@pytest.mark.parametrize("scenario", ["zeros-tie", "dup-vals"])
+@pytest.mark.parametrize(
+    ("rows", "row_lengths"),
+    [
+        # <=32 rows wider than RADIX_THRESHOLD: persistent kernel, every tier.
+        (4, [6000, 16000, 30000, 40000]),
+        # >32 rows: FilteredTopK register histogram and coarse + rescan.
+        (40, [20000, 40000]),
+        # >64 long rows: sampled top-k and its short-row fallback.
+        (80, [100000, 50000]),
+    ],
+)
+@torch.inference_mode()
+def test_persistent_topk_batched_paths(
+    scenario: str, rows: int, row_lengths: list[int]
+):
+    """Batched dispatch tiers stay exact, index-tie-broken and repeatable."""
+    n_max = max(row_lengths)
+    lengths_list = [row_lengths[r % len(row_lengths)] for r in range(rows)]
+    logits = torch.stack([_make_logits(scenario, n_max, seed=r) for r in range(rows)])
+    lengths = torch.tensor(lengths_list, dtype=torch.int32, device="cuda")
+
+    first = _run_persistent(logits, lengths, K, n_max)
+    for r, ln in enumerate(lengths_list):
+        assert frozenset(first[r].tolist()) == _reference_set(logits[r, :ln], K), (
+            f"row {r} (len {ln}) selected a wrong set"
+        )
     for _ in range(ITERS - 1):
         again = _run_persistent(logits, lengths, K, n_max)
         assert torch.equal(again, first), "batch output differs between runs"

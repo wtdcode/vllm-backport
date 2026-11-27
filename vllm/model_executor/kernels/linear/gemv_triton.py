@@ -3,14 +3,14 @@
 """One-launch bf16 GEMV for narrow-N unquantized projections.
 
 cuBLAS handles skinny GEMMs by splitting K and reducing, which for
-``N = 64`` costs two launches (a ``dot_kernel`` plus a ``reduce_1Block_kernel``)
+`N = 64` costs two launches (a `dot_kernel` plus a `reduce_1Block_kernel`)
 where the whole operation moves only a few hundred KB. Assigning one CTA per
 output row removes the split entirely: N supplies the parallelism, each CTA
 owns its output, and nothing needs reducing across CTAs.
 
 This only pays at GEMV-ish shapes -- small M, N large enough to fill the
 device, K large enough that a CTA has work to do. Prefill-sized M belongs on
-cuBLAS, so callers gate on :func:`should_use_triton_gemv`.
+cuBLAS, so callers gate on `should_use_triton_gemv`.
 """
 
 import torch
@@ -74,7 +74,7 @@ def _bf16_gemv_kernel(
 
 
 def should_use_triton_gemv(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Whether :func:`bf16_gemv` applies to this call."""
+    """Whether `bf16_gemv` applies to this call."""
     return (
         current_platform.is_cuda()
         and x.dtype == torch.bfloat16
@@ -93,9 +93,9 @@ def bf16_gemv(
     weight: torch.Tensor,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """``x @ weight.T`` for small M, in one launch.
+    """`x @ weight.T` for small M, in one launch.
 
-    Accumulates in fp32 and stores directly in ``out_dtype``, so an fp32
+    Accumulates in fp32 and stores directly in `out_dtype`, so an fp32
     output is genuinely fp32 rather than a bf16 result cast upward.
     """
     m, k = x.shape

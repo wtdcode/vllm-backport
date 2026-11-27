@@ -449,6 +449,7 @@ class HierarchicalAllReduce:
         device: this rank's CUDA device.
         islands: rank partition, e.g. [[0,1,2,3],[4,5,6,7]]. Exactly two
             islands of equal size are supported.
+
     """
 
     def __init__(

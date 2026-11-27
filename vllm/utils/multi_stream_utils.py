@@ -43,6 +43,7 @@ def maybe_execute_in_parallel(
 
     Returns:
         Tuple of (fn0_result, fn1_result).
+
     """
     if envs.VLLM_DISABLE_MULTI_STREAM_PARALLEL:
         aux_stream = None
@@ -73,6 +74,7 @@ def execute_in_parallel(
     done_events: list[torch.cuda.Event],
     aux_streams: list[torch.cuda.Stream] | None = None,
     enable: bool = False,
+    default_first: bool = False,
 ) -> tuple[Any, list[Any]]:
     """Run default_fn on the current stream and aux_fns concurrently on
     aux_streams.
@@ -100,10 +102,15 @@ def execute_in_parallel(
             so callers that pass aux_streams must also pass enable=True
             (typically gated by an env var) to actually overlap. When False,
             execution falls back to sequential on the current stream.
+        default_first: When True, enqueue the default chain before the aux
+            chains. The default chain is typically the longest, so it starts
+            first; the aux streams still only wait on start_event, so they
+            overlap the default chain. Defaults to False.
 
     Returns:
         Tuple of (default_result, aux_results) where aux_results[i] is the
         result of aux_fns[i] (or None when skipped).
+
     """
     if envs.VLLM_DISABLE_MULTI_STREAM_PARALLEL:
         aux_streams = None
@@ -129,6 +136,8 @@ def execute_in_parallel(
     pending: list[torch.cuda.Event] = []
 
     start_event.record()
+    if default_first:
+        default_result = default_fn()
     for i, fn in enumerate(aux_fns):
         if fn is None:
             continue
@@ -137,8 +146,8 @@ def execute_in_parallel(
             aux_results[i] = fn()
             done_events[i].record()
         pending.append(done_events[i])
-
-    default_result = default_fn()
+    if not default_first:
+        default_result = default_fn()
 
     for ev in pending:
         ev.wait()

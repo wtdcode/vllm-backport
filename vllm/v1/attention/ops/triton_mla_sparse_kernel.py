@@ -447,6 +447,7 @@ def triton_mla_sparse_attention(
 
     Returns:
         out:   [num_tokens, num_heads_q, _BLOCK_DV] bf16
+
     """
     num_tokens, num_heads_q, dim_qk = q.shape
     # DeepSeek-V3.2 / GLM-5 carry a 64-wide RoPE tail (dim_qk 576); GLM-5.3-Flash

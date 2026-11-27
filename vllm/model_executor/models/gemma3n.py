@@ -16,6 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections.abc import Iterable
+from dataclasses import replace
 
 import torch
 from torch import nn
@@ -185,7 +186,7 @@ class Gemma3nAltUp(nn.Module):
 
 
 class Gemma3nLaurelBlock(nn.Module):
-    """Learned Augmented Residual Layer"""
+    """Learned Augmented Residual Layer."""
 
     def __init__(
         self,
@@ -350,17 +351,7 @@ class Gemma3nAttention(nn.Module):
         is_sliding = layer_type == "sliding_attention"
         self.sliding_window = config.sliding_window if is_sliding else None
 
-        # Initialize the rotary embedding.
-        if layer_type in config.rope_parameters:
-            # Transformers v5 rope config.
-            rope_parameters = config.rope_parameters[layer_type]
-        else:
-            # Transformers v4 rope config.
-            # Global attention. Use the values in config.json.
-            rope_parameters = config.rope_parameters.copy()
-            # Local attention. Override the values in config.json.
-            if is_sliding:
-                rope_parameters["rope_theta"] = config.rope_local_base_freq
+        rope_parameters = config.rope_parameters[layer_type]
 
         kv_sharing_target_layer_name = None
         if self.is_kv_shared_layer:
@@ -480,7 +471,7 @@ class Gemma3nDecoderLayer(nn.Module):
         )
         self.mlp = Gemma3nMLP(
             hidden_size=config.hidden_size,
-            # NOTE: Matformer https://github.com/huggingface/transformers/blob/a52478253bbe522a420e88ea3940d4d98a935300/src/transformers/models/gemma3n/modular_gemma3n.py#L258 # noqa: E501
+            # NOTE: Matformer https://github.com/huggingface/transformers/blob/a52478253bbe522a420e88ea3940d4d98a935300/src/transformers/models/gemma3n/modular_gemma3n.py#L258
             intermediate_size=config.intermediate_size[extract_layer_index(prefix)],
             hidden_activation=config.hidden_activation,
             quant_config=quant_config,
@@ -593,9 +584,7 @@ class Gemma3nDecoderLayer(nn.Module):
     enable_if=lambda vllm_config: vllm_config.cache_config.kv_sharing_fast_prefill
 )
 class Gemma3nSelfDecoder(nn.Module):
-    """
-    Includes altup embedding and self decoder layers
-    """
+    """Includes altup embedding and self decoder layers."""
 
     def __init__(
         self,
@@ -776,9 +765,7 @@ class Gemma3nSelfDecoder(nn.Module):
     enable_if=lambda vllm_config: vllm_config.cache_config.kv_sharing_fast_prefill
 )
 class Gemma3nCrossDecoder(nn.Module):
-    """
-    Cross-decoder layers
-    """
+    """Cross-decoder layers."""
 
     def __init__(
         self,
@@ -1017,12 +1004,25 @@ class Gemma3nTextModel(nn.Module, SupportsQuant):
         self.per_layer_inputs[:num_padded_logits_indices].copy_(
             per_layer_inputs_adjusted[logits_indices_padded]
         )
+
+        # Update batch_descriptor so the cross-decoder's piecewise
+        # CUDAGraphWrapper dispatches to the correct (reduced) batch size.
+        forward_context = get_forward_context()
+        orig_batch_desc = forward_context.batch_descriptor
+        if orig_batch_desc is not None:
+            forward_context.batch_descriptor = replace(
+                orig_batch_desc, num_tokens=num_padded_logits_indices
+            )
+
         cross_decoder_hidden_states = self.cross_decoder(
             positions=self.positions[:num_padded_logits_indices],
             hidden_states=self.hidden_states[:num_padded_logits_indices],
             per_layer_inputs=self.per_layer_inputs[:num_padded_logits_indices],
             **kwargs,
         )
+
+        # Restore the original batch_descriptor
+        forward_context.batch_descriptor = orig_batch_desc
 
         if num_logits_indices is not None:
             assert num_logits_indices > 0

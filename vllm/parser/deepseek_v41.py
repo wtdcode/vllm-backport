@@ -31,6 +31,7 @@ from vllm.parser.deepseek_v4 import (
 from vllm.parser.deepseek_v4 import (
     DeepSeekV4Parser,
     _dsml_arg_converter,
+    _dsml_arg_value_extender,
     deepseek_v4_config,
 )
 from vllm.parser.engine.parser_engine_config import ParserEngineConfig
@@ -41,12 +42,17 @@ DSML_INVOKE_PREFIX = '<｜DSML｜ invoke name="'
 DSML_INVOKE_END = "</｜DSML｜ invoke>"
 DSML_PARAM_START = "<｜DSML｜ parameter"
 DSML_PARAM_CLOSE = "</｜DSML｜ parameter>"
+# Turn markers, so a prompt-closed reasoning block is only honored in the
+# current turn (continue_final_message, or a template that skips thinking).
+DEEPSEEK_TURN_BOUNDARY_TOKENS = frozenset({"<｜User｜>", "<｜Assistant｜>"})
 
-# Spelling variants of ``DSML_TOOL_START`` tolerated on input. The checkpoint
-# drops the separating space, and at long context falls back to the unspaced V4
-# wrapper, so the V4 spellings are accepted too. First entry of each terminal's
+# Spelling variants of ``DSML_TOOL_START`` tolerated on input: V4's
+# ``tool_calls`` wrapper name with V4.1's spacing (#62051), and, because the
+# checkpoint drops the separating space and at long context falls back to the
+# unspaced V4 wrapper, the V4 spellings too. First entry of each terminal's
 # tuple stays the canonical one that ``terminal_literal`` reports.
 DSML_TOOL_START_VARIANTS: tuple[str, ...] = (
+    "<｜DSML｜ tool_calls>",
     "<｜DSML｜calls>",
     "<｜DSML｜ call>",
     _V4_TOOL_START,
@@ -76,21 +82,18 @@ _TOLERATED_VARIANTS: dict[str, tuple[str, ...]] = {
 
 # The space after the marker is the only difference between the two families,
 # and it is the part that gets dropped, so parameter patterns accept it
-# optionally rather than pinning one spelling.
+# optionally rather than pinning one spelling (`_param_patterns` otherwise).
 _PARAM_OPEN = r"<｜DSML｜ ?parameter"
 _PARAM_SHUT = r"</｜DSML｜ ?parameter>"
-
+_PARAM_HEAD = rf'{_PARAM_OPEN}\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
 _PARAM_RE = re.compile(
-    rf'{_PARAM_OPEN}\s+name="([^"]+)"\s+string="(true|false)">'
-    r"(.*?)"
-    rf"(?:{_PARAM_SHUT}|(?={_PARAM_OPEN}\s+name=))",
-    re.DOTALL,
+    rf"{_PARAM_HEAD}(.*?)(?:{_PARAM_SHUT}|(?={_PARAM_OPEN}\s+name=))", re.DOTALL
 )
-_PARTIAL_PARAM_RE = re.compile(
-    rf'{_PARAM_OPEN}\s+name="([^"]+)"\s+string="(true|false)">'
-    r"(.*)$",
-    re.DOTALL,
-)
+_PARTIAL_PARAM_RE = re.compile(rf"{_PARAM_HEAD}(.*)\Z", re.DOTALL)
+# What the streaming helpers look for to spot the next tag: the prefix both
+# spellings of the parameter tags share.
+_PARAM_TAG_OPEN = "<｜DSML｜"
+_PARAM_TAG_SHUT = "</｜DSML｜"
 
 
 @functools.cache
@@ -105,6 +108,7 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
     return replace(
         config,
         name="deepseek_v41",
+        turn_boundary_tokens=DEEPSEEK_TURN_BOUNDARY_TOKENS,
         terminals={**config.terminals, **terminal_overrides},
         # Token-id matching has no variant form: a special token is either in
         # the vocab or it is not, so keep the canonical spelling here.
@@ -116,6 +120,14 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
             _dsml_arg_converter,
             param_re=_PARAM_RE,
             partial_param_re=_PARTIAL_PARAM_RE,
+            param_start=_PARAM_TAG_OPEN,
+        ),
+        arg_value_extender=functools.partial(
+            _dsml_arg_value_extender,
+            param_re=_PARAM_RE,
+            partial_param_re=_PARTIAL_PARAM_RE,
+            param_start=_PARAM_TAG_OPEN,
+            param_close=_PARAM_TAG_SHUT,
         ),
     )
 

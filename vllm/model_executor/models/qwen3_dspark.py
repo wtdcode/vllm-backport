@@ -8,9 +8,9 @@ dependency with a lightweight sequential Markov head.
 
 The parallel backbone is a standard Qwen3 decoder stack reused from the
 DFlash Qwen3 draft (see qwen3_dflash.py). DSpark adds:
-  * ``markov_head``: low-rank V x r / r x V transition bias added to the base
+  * `markov_head`: low-rank V x r / r x V transition bias added to the base
     logits, sampled left-to-right by the speculator (the sequential stage).
-  * ``confidence_head``: per-position acceptance-probability estimate.
+  * `confidence_head`: per-position acceptance-probability estimate.
 
 DSparkMarkovHead and DSparkConfidenceHead are shared with the DSV4-style DSpark model.
 """
@@ -26,6 +26,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     dequantize_to_dtype,
     nvfp4_gathered_bias,
@@ -35,6 +36,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 from vllm.platforms import current_platform
+from vllm.v1.worker.gpu.spec_decode.dspark.config import DSparkSpeculatorConfig
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.spec_decode.dspark.markov_argmax import (
@@ -53,9 +55,9 @@ logger = init_logger(__name__)
 
 
 def dspark_vocab_shard_enabled() -> bool:
-    """Whether the Markov head shards ``markov_w2`` over the TP group.
+    """Whether the Markov head shards `markov_w2` over the TP group.
 
-    Keyed on the existing ``use_local_argmax_reduction`` speculative-config
+    Keyed on the existing `use_local_argmax_reduction` speculative-config
     flag rather than a DSpark-private switch: that flag names exactly this
     trade -- vocab-parallel local argmax instead of an all-gather of full
     logits, greedy selection only -- and the weight layout has to be fixed
@@ -71,21 +73,21 @@ def dspark_vocab_shard_enabled() -> bool:
 class DSparkMarkovHead(nn.Module):
     """Sequential transition-bias head (low-rank V x r, r x V).
 
-    ``markov_w1[token]`` embeds the previously sampled token (target vocab,
-    ``vocab_size``); ``markov_w2`` projects it to a draft-vocab bias
-    (``draft_vocab_size``) added to the base draft logits. The two sizes
+    `markov_w1[token]` embeds the previously sampled token (target vocab,
+    `vocab_size`); `markov_w2` projects it to a draft-vocab bias
+    (`draft_vocab_size`) added to the base draft logits. The two sizes
     coincide for full-vocab drafts.
 
-    ``markov_w1`` is always replicated: it is indexed by a token id, so
-    sharding it would buy nothing. ``markov_w2`` is replicated by default for
+    `markov_w1` is always replicated: it is indexed by a token id, so
+    sharding it would buy nothing. `markov_w2` is replicated by default for
     the reason the head's original docstring gives -- it runs once per draft
     position, and sharding it would add a full-vocab gather to each. That
     argument holds for the *probabilistic* path, which needs whole processed
     logit rows to verify against, and fails for the greedy path, where the only
     thing read off the vocab axis is an argmax, and an argmax reduces. So under
-    ``use_local_argmax_reduction`` (greedy only, validated by the speculator)
-    ``markov_w2`` becomes vocab-parallel and selection goes through
-    :meth:`select_top_tokens`, which exchanges one (value, id) pair per rank
+    `use_local_argmax_reduction` (greedy only, validated by the speculator)
+    `markov_w2` becomes vocab-parallel and selection goes through
+    `select_top_tokens`, which exchanges one (value, id) pair per rank
     instead of a [B, V] row.
     """
 
@@ -97,6 +99,7 @@ class DSparkMarkovHead(nn.Module):
         prefix: str,
         quant_config: QuantizationConfig | None = None,
         retain_weight_for_gather: bool = False,
+        quant_method: QuantizeMethodBase | None = None,
         *,
         shard_vocab: bool | None = None,
     ) -> None:
@@ -112,12 +115,13 @@ class DSparkMarkovHead(nn.Module):
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "markov_w2"),
             disable_tp=not shard_vocab,
+            quant_method=quant_method,
         )
         self.markov_w2._retain_weight_for_gather = retain_weight_for_gather
         self.markov_w2.is_w4a16_nvfp4 = False
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """r-dim Markov embedding of ``token_ids`` ([B] -> [B, r])."""
+        """r-dim Markov embedding of `token_ids` ([B] -> [B, r])."""
         return self.markov_w1(token_ids)
 
     def bias(
@@ -136,9 +140,9 @@ class DSparkMarkovHead(nn.Module):
         index: torch.Tensor,
         scale: float = 1.0,
     ) -> torch.Tensor:
-        """Apply the Markov bias only to selected rows of ``logits``.
+        """Apply the Markov bias only to selected rows of `logits`.
 
-        The caller initializes ``logits`` to ``-inf`` once for all draft
+        The caller initializes `logits` to `-inf` once for all draft
         positions. This method scatters the corrected candidate values into
         that dense buffer so the normal sampler sees the truncated proposal.
         """
@@ -204,10 +208,10 @@ class DSparkMarkovHead(nn.Module):
     ) -> torch.Tensor:
         """Greedy draft ids from base logits + this head's transition bias.
 
-        ``base_shard_logits`` is this rank's slice of the base draft logits
-        ([B, V/TP], from ``LogitsProcessor.get_shard_logits``); the argmax runs
+        `base_shard_logits` is this rank's slice of the base draft logits
+        ([B, V/TP], from `LogitsProcessor.get_shard_logits`); the argmax runs
         over the sum of the two heads, which share the shard layout because
-        both are ``ParallelLMHead``\\ s over the draft vocab. Returns draft-vocab
+        both are `ParallelLMHead`s over the draft vocab. Returns draft-vocab
         ids -- the caller still applies its draft-to-target mapping.
         """
         return logits_processor.get_top_tokens(
@@ -217,9 +221,9 @@ class DSparkMarkovHead(nn.Module):
     def fusion_operands(
         self, logits_processor: LogitsProcessor
     ) -> "MarkovFusionOperands | None":
-        """Operands for the fused Markov step, or ``None`` to decline.
+        """Operands for the fused Markov step, or `None` to decline.
 
-        The fused kernel reimplements :meth:`select_top_tokens` end to end, so
+        The fused kernel reimplements `select_top_tokens` end to end, so
         it can only run where that path is exactly an unquantized GEMV plus an
         add: no soft cap, no logit scale, no separate head dtype, no quantized
         or non-row-major weight. Anything else falls back to the eager chain
@@ -327,14 +331,20 @@ class Qwen3DSparkModel(DFlashQwen3Model):
 
 
 class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
+    # The speculator this is a draft model of (see SpeculativeDraftModel).
+    speculator_config_class = DSparkSpeculatorConfig
+    model_cls = Qwen3DSparkModel
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
-        self.draft_model_config = vllm_config.speculative_config.draft_model_config
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        self.draft_model_config = speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
         if getattr(self.config, "draft_vocab_size", None) is None:
             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
         target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
-        self.model = Qwen3DSparkModel(
+        self.model = self.model_cls(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
             start_layer_id=target_layer_num,
@@ -350,7 +360,10 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             self.config.draft_vocab_size, scale=logit_scale
         )
         self.target_vocab_size = vllm_config.model_config.get_vocab_size()
-        if self.config.draft_vocab_size != self.target_vocab_size:
+        # Only a pruned draft (subset of the target vocab) needs a d2t mapping to
+        # scatter ids up. A draft >= the target vocab (e.g. padded to the target's
+        # physical embedding size) maps identically, so no d2t is needed.
+        if self.config.draft_vocab_size < self.target_vocab_size:
             self.draft_id_to_target_id = nn.Parameter(
                 torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
                 requires_grad=False,
@@ -376,6 +389,10 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         return self.model.markov_head.select_top_tokens(
             markov_embed, base_shard_logits, self.logits_processor
         )
+
+    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This TP rank's vocab shard of compute_draft_logits, not gathered."""
+        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         # Map draft-vocab ids to target ids (identity for full-vocab drafts).
@@ -419,7 +436,6 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         includes_embed_tokens = False
         includes_lm_head = False
         includes_draft_id_mapping = False
-        includes_confidence_head = False
         for name, loaded_weight in weights:
             # t2d is training-only; the draft remaps via d2t at sampling time.
             if "t2d" in name:
@@ -433,8 +449,6 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
                 includes_embed_tokens = True
             if "lm_head" in name:
                 includes_lm_head = True
-            if "confidence_head" in name:
-                includes_confidence_head = True
             model_weights[name] = loaded_weight
             # Sets has_own_embed_tokens / has_own_lm_head so load_dspark_model
             # knows whether to keep these or alias the target's.
@@ -443,23 +457,6 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         # mask_embedding is an unused placeholder param; DSpark masks via the vocab row.
         # embed_tokens / lm_head are optional; when omitted they are shared from
         # the target by load_dspark_model, so skip the unloaded params here.
-        uses_expanded_input_vocab = self.config.vocab_size > self.target_vocab_size
-        uses_reduced_vocab = self.config.draft_vocab_size != self.target_vocab_size
-        if uses_expanded_input_vocab and not includes_embed_tokens:
-            raise ValueError(
-                "Qwen3 DSpark checkpoints whose input vocab_size is larger than "
-                "the target vocabulary must include embed_tokens weights."
-            )
-        if uses_reduced_vocab and not includes_lm_head:
-            raise ValueError(
-                "Reduced-vocabulary Qwen3 DSpark checkpoints must include "
-                "lm_head weights; the full target lm_head cannot be shared."
-            )
-        if uses_reduced_vocab and not includes_draft_id_mapping:
-            raise ValueError(
-                "Reduced-vocabulary Qwen3 DSpark checkpoints must include a "
-                "d2t mapping so sampled draft ids can be converted to target ids."
-            )
 
         orig_to_new_substr = {"mask_embedding": None}
         if not includes_embed_tokens:
@@ -468,10 +465,8 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             orig_to_new_substr["lm_head"] = None
         if not includes_draft_id_mapping:
             orig_to_new_substr["draft_id_to_target_id"] = None
-        if self.model.confidence_head is None or not includes_confidence_head:
-            self.model.confidence_head = None
+        if self.model.confidence_head is None:
             orig_to_new_substr["confidence_head"] = None
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
         loader.load_weights(model_weights.items(), mapper=mapper)
-        self.model._build_fused_kv_buffers()
