@@ -80,7 +80,7 @@
       "default": "https://github.com/wtdcode/LMCache.git"
     },
     "LMCACHE_REF": {
-      "default": "2acb7b24bea5ac55c5dfc6a41366099236ec525c"
+      "default": "e352eb72d2f20df0ec9e7d4dbaea3b560d9c482f"
     },
     "GDRCOPY_CUDA_VERSION": {
       "default": "12.8"
