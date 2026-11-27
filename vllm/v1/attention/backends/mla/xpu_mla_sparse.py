@@ -193,6 +193,8 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
 
 class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndicesBuffer):
     is_sparse = True
+    # Subclasses whose kernel decodes a quantized cache set this.
+    supports_fp8_kv: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -259,7 +261,7 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
         # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
         # MQA 576/512 approach for both prefill and decode
 
-        if is_quantized_kv_cache(self.kv_cache_dtype):
+        if is_quantized_kv_cache(self.kv_cache_dtype) and not self.supports_fp8_kv:
             raise NotImplementedError("FP8 kv is not supported with XPU MLA Sparse yet")
 
         # Concatenate q if it's a tuple (ql_nope, q_pe)

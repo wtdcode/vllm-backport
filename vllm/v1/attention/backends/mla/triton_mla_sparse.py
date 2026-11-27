@@ -6,9 +6,11 @@ from typing import ClassVar
 
 import torch
 
+from vllm.config.cache import CacheDType
 from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
+    AttentionLayer,
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
@@ -22,6 +24,8 @@ from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
     triton_mla_sparse_attention,
 )
 
+_FP8_KV_DTYPES: tuple[CacheDType, ...] = ("fp8", "fp8_e4m3")
+
 
 class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
     # XPU base keeps NEVER (not validated under cudagraph); this subclass
@@ -33,8 +37,13 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
     """Triton sparse-MLA impl with split-KV decode (3-7× faster than the
     single-pass XPU base for single-query decode on SM80 / SM121)."""
 
+    # Plain e4m3 rows with a per-tensor k_scale, as concat_and_cache_mla writes
+    # them; the query stays bf16 and the kernel decodes K on load.
+    supports_fp8_kv = True
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self._fp8_k_scale = 1.0
         self._sm_count: int | None = None
         if self.topk_indices_buffer is not None:
             self._sm_count = num_compute_units(self.topk_indices_buffer.device.index)
@@ -50,6 +59,8 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         dim_qk = self.head_size
         q = torch.empty(1, self.num_heads, dim_qk, dtype=torch.bfloat16, device=device)
         kv = torch.empty(64, 1, dim_qk, dtype=torch.bfloat16, device=device)
+        if self.kv_cache_dtype in _FP8_KV_DTYPES:
+            kv = torch.zeros(64, 1, dim_qk, dtype=torch.float8_e4m3fn, device=device)
         indices = torch.zeros(1, 1, topk, dtype=torch.int32, device=device)
         for splits in KV_SPLITS_CANDIDATES:
             triton_mla_sparse_attention(
@@ -60,6 +71,16 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 num_kv_splits=splits,
                 sm_count=self._sm_count,
             )
+
+    def forward_mqa(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: XPUMLASparseMetadata,
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        self._fp8_k_scale = float(getattr(layer, "_k_scale_float", None) or 1.0)
+        return super().forward_mqa(q, kv_c_and_k_pe_cache, attn_metadata, layer)
 
     def _forward_bf16_kv(
         self,
@@ -79,12 +100,20 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             topk_indices,
             sm_scale=self.softmax_scale,
             sm_count=self._sm_count,
+            k_scale=self._fp8_k_scale,
         )
         return output
 
 
 class TritonMLASparseBackend(XPUMLASparseBackend):
     """Same bf16 sparse-MLA contract as the XPU backend, CUDA Triton kernels."""
+
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "float16",
+        "bfloat16",
+        *_FP8_KV_DTYPES,
+    ]
 
     @staticmethod
     def get_name() -> str:

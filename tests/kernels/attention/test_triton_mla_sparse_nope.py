@@ -48,3 +48,34 @@ def test_triton_mla_sparse_nope_and_rope(dim_qk: int, num_kv_splits: int):
     err = (out.float() - ref).abs().max().item()
     rel = err / ref.abs().max().item()
     assert rel < 2e-2, f"dim_qk={dim_qk} splits={num_kv_splits} rel={rel:.2e}"
+
+
+@pytest.mark.parametrize("dim_qk", [576, 512])
+@pytest.mark.parametrize("num_kv_splits", [1, 4])
+def test_triton_mla_sparse_fp8_kv(dim_qk: int, num_kv_splits: int):
+    """An e4m3 cache (`kv / k_scale`, as concat_and_cache_mla writes it) is
+    decoded exactly: same output as the bf16 kernel on the dequantized rows,
+    and within fp8 quantization error of the unquantized ones."""
+    torch.manual_seed(0)
+    dev = "cuda"
+    T, H, N, K = 4, 16, 2048, 128
+    k_scale = 0.5
+    q = torch.randn(T, H, dim_qk, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(N, 1, dim_qk, dtype=torch.bfloat16, device=dev)
+    kv_fp8 = (kv.float() / k_scale).to(torch.float8_e4m3fn)
+    idx = torch.stack([torch.randperm(N, device=dev)[:K].int() for _ in range(T)])
+    idx = idx.view(T, 1, K)
+    idx[0, 0, K // 2 :] = -1
+    sm = dim_qk**-0.5
+
+    def run(cache, **kwargs):
+        return triton_mla_sparse_attention(
+            q, cache, idx, sm_scale=sm, num_kv_splits=num_kv_splits, **kwargs
+        ).float()
+
+    out = run(kv_fp8, k_scale=k_scale)
+    dequant = run((kv_fp8.float() * k_scale).to(torch.bfloat16))
+    torch.testing.assert_close(out, dequant, atol=2e-3, rtol=0)
+    ref = run(kv)
+    rel = ((out - ref).norm() / ref.norm()).item()
+    assert rel < 5e-2, f"dim_qk={dim_qk} splits={num_kv_splits} rel={rel:.2e}"
