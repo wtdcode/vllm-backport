@@ -4,19 +4,17 @@ A vLLM fork that focuses on running frontier models on older cards like A6000, 3
 
 Status:
 
-| Supported Models | Quantization | KV Cache (`--kv-cache-dtype`) | Status |
+| Supported Models | Quantization | KV Cache | Status |
 | --- | --- | --- | --- |
 | `DeepSeek-v4-Flash-0731` | Native FP4 | `fp8_ds_mla` | Fully Supported (0.6.0+) |
-| `Qwen3.8-27B` | BF16, AWQ W4A16 | BF16 (default), `fp8` | Fully Supported (v0.8.0+) |
-| `Qwen3.8-Flash-Next` | FP8, [AWQ W4A16](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16) | BF16 (default), `fp8` | Fully Supported (v0.9.0+) |
-| `GLM-5.3-Flash` | FP8, [AWQ W4A16](https://huggingface.co/wtdcode/GLM-5.3-Flash-AWQ-W4A16) | BF16 (default), `fp8` | Fully Supported (v0.11.2+) |
+| `Qwen3.8-27B` | BF16, AWQ W4A16 | BF16, `fp8` | Fully Supported (v0.8.0+) |
+| `Qwen3.8-Flash-Next` | FP8, [AWQ W4A16](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16) | BF16, `fp8` | Fully Supported (v0.9.0+) |
+| `GLM-5.3-Flash` | FP8, [AWQ W4A16](https://huggingface.co/wtdcode/GLM-5.3-Flash-AWQ-W4A16) | BF16, `fp8` | Fully Supported (v0.11.2+) |
 | `DeepSeek-V4-Flash-Vision-Exp` | Native FP4 | `fp8_ds_mla` | Fully Supported (v0.13.0+) |
-| `DeepSeek-V4.1-Flash` | Native FP4 with Engram | `nvfp4_ds_mla` on sm80, `fp8_ds_mla` on sm86/sm89 (both picked by default) | Fully Supported (v0.13.0+) |
-| `MiMo-V2.6-Flash` | FP8 | BF16 (default), `fp8` (v0.14.1+) | Fully Supported (v0.14.0+) |
-| `MiniMax-M3.1-Flash` | MXFP8 + NVFP4 experts (official checkpoint) | BF16 (default), `fp8` (v0.14.1+) | Supported (v0.14.0+), text only verified |
-| `Hy4-Flash` | [FP8](https://huggingface.co/tencent/Hy4-flash-FP8) | BF16 (default), `fp8_ds_mla` | Supported (v0.14.1+), verified on sm80 |
-
-The KV cache column lists what works on sm80/sm86/sm89. An FP8-class cache holds roughly twice the tokens of BF16.
+| `DeepSeek-V4.1-Flash` | Native FP4 with Engram | `nvfp4_ds_mla` (sm80), `fp8_ds_mla` | Fully Supported (v0.13.0+) |
+| `MiMo-V2.6-Flash` | FP8 | BF16, `fp8` | Fully Supported (v0.14.0+) |
+| `MiniMax-M3.1-Flash` | MXFP8 + NVFP4 | BF16, `fp8` | Supported (v0.14.0+) |
+| `Hy4-Flash` | FP8 | BF16, `fp8_ds_mla` | Supported (v0.14.1+) |
 
 Note we have a paired [LMCache](https://github.com/wtdcode/LMCache/tree/vllm-backport) fork for production kvcache serving, **which is also built into our docke images.**
 
