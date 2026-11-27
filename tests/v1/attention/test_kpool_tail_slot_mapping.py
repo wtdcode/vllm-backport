@@ -113,9 +113,6 @@ def legacy_generic_tail_slots(block_table, query_start_loc, positions):
 def circular_tail_slots(
     slot_mapping, block_table, query_start_loc, positions, num_actual, num_reqs
 ):
-    out_full = torch.full(
-        (slot_mapping.shape[0],), -1, dtype=torch.int64, device=slot_mapping.device
-    )
     return compute_kpool_tail_slot_mapping(
         slot_mapping,
         block_table,
@@ -124,7 +121,6 @@ def circular_tail_slots(
         num_actual,
         num_reqs,
         KPOOL,
-        out_full=out_full,
     )
 
 
@@ -259,10 +255,7 @@ def make_common_metadata(per_req_positions, own_blocks, with_positions=True):
 def make_tail_builder(block_size=KPOOL, max_num_batched_tokens=128):
     builder = object.__new__(KpoolTailMetadataBuilder)
     builder.kv_cache_spec = SimpleNamespace(block_size=block_size)
-    # Persistent, address-stable buffer (see compute_kpool_tail_slot_mapping).
-    builder.tail_slot_mapping_buffer = torch.full(
-        (max_num_batched_tokens,), -1, dtype=torch.int64
-    )
+    builder.slot_mapping_buffer = torch.empty(max_num_batched_tokens, dtype=torch.int64)
     return builder
 
 
@@ -286,14 +279,12 @@ def test_builder_build_uses_circular_mapping():
     )
 
 
-def test_builder_build_rejects_missing_positions():
-    """Without positions the tail builder must refuse, never fall back:
-    the common mapping addresses the pool-granular indexer cache, and under
-    graph capture a wrong mapping gets baked into the captured kernels."""
+def test_builder_build_falls_back_without_positions():
+    """Capture / dummy builds without positions keep the generic mapping."""
     per_req = [list(range(10))]
     cam = make_common_metadata(per_req, [5], with_positions=False)
-    with pytest.raises(ValueError, match="positions"):
-        KpoolTailMetadataBuilder.build(make_tail_builder(), 0, cam)
+    meta = KpoolTailMetadataBuilder.build(make_tail_builder(), 0, cam)
+    assert meta.slot_mapping is cam.slot_mapping
 
 
 def test_builder_updates_draft_mapping():

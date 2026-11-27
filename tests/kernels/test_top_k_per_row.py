@@ -2618,10 +2618,11 @@ def test_deep_select_topk_preallocated_output() -> None:
 def _has_flashinfer_topk() -> bool:
     if not current_platform.is_cuda():
         return False
-    # find_spec only: importing flashinfer initializes CUDA at import time.
-    import importlib.util
+    # Same probe as SparseIndexerTopK: the package plus cubins or a JIT
+    # toolchain (nvcc and ninja), without importing flashinfer.
+    from vllm.utils.flashinfer import has_flashinfer
 
-    return importlib.util.find_spec("flashinfer") is not None
+    return has_flashinfer()
 
 
 def _has_flashinfer_gvr2() -> bool:

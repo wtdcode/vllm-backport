@@ -855,24 +855,18 @@ def compute_kpool_tail_slot_mapping(
     num_actual_tokens: int,
     num_reqs: int,
     kpool: int,
-    out_full: torch.Tensor,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Map every token to its request's one circular tail block.
-
-    `out_full` is the builder's persistent buffer: FULL cudagraph captures bake
-    its address into the tail-consuming kernels. It is refilled with -1 ("no
-    tail slot") every build, since a replayed graph indexes up to the captured
-    padded length, and padded rows never inherit `slot_mapping`, which
-    addresses the pool-granular indexer cache rather than the tail ring.
-    """
-    out_full.fill_(-1)
-    out = out_full[: slot_mapping.numel()].view_as(slot_mapping)
+    """Map every token to its request's one circular tail block."""
+    if out is None:
+        out = torch.empty_like(slot_mapping)
+    else:
+        assert out.shape == slot_mapping.shape
     if slot_mapping.is_cuda and slot_mapping.dim() == 1 and num_reqs > 0:
         block = 256
         num_tokens = slot_mapping.shape[0]
         num_actual_tokens = min(num_actual_tokens, num_tokens)
-        # One program per request; the padded tail keeps the -1 fill.
-        grid = (num_reqs,)
+        grid = (num_reqs + triton.cdiv(num_tokens - num_actual_tokens, block),)
         _kpool_tail_slot_mapping_kernel[grid](
             slot_mapping,
             block_table,
@@ -891,6 +885,7 @@ def compute_kpool_tail_slot_mapping(
     # Torch fallback: CPU tensors (the CPU unit tests), non-1D or empty inputs.
     # Production always takes the Triton path above — spec-decode tokens arrive
     # flattened token-major, so slot_mapping is 1D there too.
+    out.copy_(slot_mapping)
     if num_actual_tokens == 0:
         return out
     tokens = torch.arange(num_actual_tokens, device=slot_mapping.device)
@@ -919,9 +914,8 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self.tail_slot_mapping_buffer = torch.full(
-            (vllm_config.scheduler_config.max_num_batched_tokens,),
-            -1,
+        self.slot_mapping_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int64,
             device=device,
         )
@@ -935,23 +929,22 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(common_attn_metadata)
         )
+        slot_mapping = common_attn_metadata.slot_mapping
         positions = common_attn_metadata.positions
-        if positions is None:
-            # The common slot mapping addresses the pool-granular indexer
-            # cache, not the per-request tail ring; never fall back to it.
-            raise ValueError(
-                "KpoolTailMetadataBuilder requires CommonAttentionMetadata.positions"
+        if positions is not None:
+            slot_mapping_buffer = self.slot_mapping_buffer[
+                : slot_mapping.numel()
+            ].view_as(slot_mapping)
+            slot_mapping = compute_kpool_tail_slot_mapping(
+                slot_mapping,
+                common_attn_metadata.block_table_tensor,
+                common_attn_metadata.query_start_loc,
+                positions,
+                common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.num_reqs,
+                self.kv_cache_spec.block_size,
+                out=slot_mapping_buffer,
             )
-        slot_mapping = compute_kpool_tail_slot_mapping(
-            common_attn_metadata.slot_mapping,
-            common_attn_metadata.block_table_tensor,
-            common_attn_metadata.query_start_loc,
-            positions,
-            common_attn_metadata.num_actual_tokens,
-            common_attn_metadata.num_reqs,
-            self.kv_cache_spec.block_size,
-            out_full=self.tail_slot_mapping_buffer,
-        )
         return DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,

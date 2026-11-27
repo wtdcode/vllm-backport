@@ -1452,7 +1452,7 @@ def test_degenerate_target_logits_never_emit_out_of_vocab(
         num_trials=num_trials,
     )
 
-    sampled, num_sampled = rejection_sample(
+    sampled, num_sampled = _rejection_sample(
         **inputs, num_speculative_steps=num_speculative_steps
     )
 
