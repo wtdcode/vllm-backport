@@ -12,6 +12,9 @@ Status:
 | `GLM-5.3-Flash` | FP8, [AWQ W4A16](https://huggingface.co/wtdcode/GLM-5.3-Flash-AWQ-W4A16) | BF16 (default), `fp8` | Fully Supported (v0.11.2+) |
 | `DeepSeek-V4-Flash-Vision-Exp` | Native FP4 | `fp8_ds_mla` | Fully Supported (v0.13.0+) |
 | `DeepSeek-V4.1-Flash` | Native FP4 with Engram | `nvfp4_ds_mla` on sm80, `fp8_ds_mla` on sm86/sm89 (both picked by default) | Fully Supported (v0.13.0+) |
+| `MiMo-V2.6-Flash` | FP8 | BF16 (default), `fp8` (v0.14.1+) | Fully Supported (v0.14.0+) |
+| `MiniMax-M3.1-Flash` | MXFP8 + NVFP4 experts (official checkpoint) | BF16 (default), `fp8` (v0.14.1+) | Supported (v0.14.0+), text only verified |
+| `Hy4-Flash` | [FP8](https://huggingface.co/tencent/Hy4-flash-FP8) | BF16 (default), `fp8_ds_mla` | Supported (v0.14.1+), verified on sm80 |
 
 The KV cache column lists what works on sm80/sm86/sm89. An FP8-class cache holds roughly twice the tokens of BF16.
 
@@ -207,3 +210,64 @@ vllm serve /path/to/DeepSeek-V4.1-Flash \
 
 - Expert parallel also works.
 - LMCache: Note that the KV block size is 128.
+
+#### MiMo-V2.6-Flash (v0.14.0+)
+
+```bash
+vllm serve XiaomiMiMo/MiMo-V2.6-Flash-RL \
+  --served-model-name mimo-v2.6-flash \
+  --tensor-parallel-size 8 \
+  --trust-remote-code \
+  --gpu-memory-utilization 0.92 \
+  --max-model-len 262144 \
+  --generation-config vllm \
+  --speculative-config '{"method":"dflash","model":"/path/to/MiMo-V2.6-Flash-RL/dflash","num_speculative_tokens":7}' \
+  --enable-auto-tool-choice --tool-call-parser mimo --reasoning-parser mimo
+```
+
+- Verified on 8x RTX A6000 (TP8) and 4x A100 (TP4). DFlash with 7 draft tokens accepts about 5.5 tokens per step.
+- `--kv-cache-dtype fp8` (v0.14.1+) doubles the KV pool. Batch throughput is unchanged, single-stream decode is 15-25% slower below sm89.
+
+#### MiniMax-M3.1-Flash (v0.14.0+)
+
+```bash
+vllm serve MiniMaxAI/MiniMax-M3.1-Flash \
+  --served-model-name minimax-m3.1-flash \
+  --tensor-parallel-size 8 \
+  --block-size 128 --disable-hybrid-kv-cache-manager \
+  --kv-cache-dtype fp8 --attention-config '{"indexer_kv_dtype": "fp8"}' \
+  --language-model-only \
+  --max-model-len 131072 \
+  --gpu-memory-utilization 0.90 \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":7,"attention_backend":"TRITON_ATTN","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic"}' \
+  --enable-auto-tool-choice --tool-call-parser minimax_m3 --reasoning-parser minimax_m3
+```
+
+- The official checkpoint (MXFP8 dense layers, NVFP4 experts) is the only one; there is no separate FP8 weight release.
+- Verified text-only on 8x RTX A6000 (TP8). Multimodal input is not verified yet.
+- The fp8 KV and indexer caches need v0.14.1+. On v0.14.0 use `--kv-cache-dtype bfloat16 --attention-config '{"indexer_kv_dtype": "bf16"}'` and `"kv_cache_dtype":"bfloat16"` for the draft, which halves the KV pool.
+- Use `num_speculative_tokens` 3 when aggregate throughput matters more than single-stream speed.
+
+#### Hy4-Flash (v0.14.1+)
+
+```bash
+vllm serve tencent/Hy4-flash-FP8 \
+  --served-model-name hy4-flash \
+  --tensor-parallel-size 8 --enable-expert-parallel \
+  --dtype bfloat16 \
+  --max-model-len 131072 \
+  --max-num-seqs 8 --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.92 \
+  --kv-cache-dtype fp8_ds_mla \
+  --limit-mm-per-prompt '{"image":1,"video":0}' \
+  --enable-prefix-caching \
+  --speculative-config '{"num_speculative_tokens":5,"method":"dfly"}' \
+  --enable-auto-tool-choice --tool-call-parser hy_v4 --reasoning-parser hy_v4
+```
+
+- Verified on A100 (sm80) with TP8 and TP4. sm86/sm89 are not verified yet.
+- `--enable-expert-parallel` is required. With plain TP the expert shards are not 128-aligned and startup fails; `--moe-backend marlin` also works but costs about 6 GiB more per GPU.
+- The Engram tables stay in host memory (about 127 GiB).
+- `fp8_ds_mla` holds 1.76x the tokens of the default BF16 cache at the same speed.
+- DFly cannot be combined with a KV connector, so with LMCache drop `--speculative-config`.
+- Thinking is set per request with `chat_template_kwargs: {"reasoning_effort": "high" | "no_think"}`.
