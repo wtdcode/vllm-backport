@@ -345,6 +345,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_MULTI_STREAM_PARALLEL: bool = False
     VLLM_MHC_POST_FUSE_SQRSUM: bool = False
     VLLM_MHC_PRENORM_SHARD: bool = False
+    VLLM_DSV41_SM80_TRITON: bool = False
     VLLM_UNREPLICATE_ATTN_GEMMS: bool = False
     VLLM_INDEXER_QUERY_SHARD: bool = False
     VLLM_INDEXER_QUERY_SHARD_QPATH: bool = False
@@ -2466,6 +2467,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cuBLAS route shards; below the token threshold the replicated path runs.
     "VLLM_MHC_PRENORM_SHARD": lambda: (
         os.environ.get("VLLM_MHC_PRENORM_SHARD", "0") == "1"
+    ),
+    # Route DeepSeek-V4.1 on SM80 through the SM86/SM89 Triton sparse-MLA
+    # path (fp8_ds_mla KV layout) instead of upstream's A100 CuTe DSL kernels.
+    "VLLM_DSV41_SM80_TRITON": lambda: (
+        os.environ.get("VLLM_DSV41_SM80_TRITON", "0") == "1"
     ),
     # Split the two replicated attention input GEMMs (fused_wqa_wkv and the
     # merged bf16 trio) over the token dim across TP ranks and all-gather the
