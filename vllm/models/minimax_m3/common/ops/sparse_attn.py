@@ -21,6 +21,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_lut, e4m3fn_cache_as_u8
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -93,6 +94,7 @@ def _gqa_sparse_fwd_kernel(
     BLOCK_SIZE_QH: tl.constexpr,
     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
     KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
+    fp8_lut_ptr=None,  # pre-SM89 CUDA: e4m3 -> bf16 table for a uint8 cache view
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q = tl.program_id(0)
@@ -162,6 +164,8 @@ def _gqa_sparse_fwd_kernel(
                 other=0.0,
             )
             if USE_FP8:
+                if fp8_lut_ptr is not None:
+                    k = _decode_fp8_lut(k, False, fp8_lut_ptr)
                 k = k.to(q.dtype)
                 if KV_SCALE_MODE == 1:
                     k = (k * tl.load(k_scale_ptr)).to(q.dtype)
@@ -194,6 +198,8 @@ def _gqa_sparse_fwd_kernel(
                 other=0.0,
             )
             if USE_FP8:
+                if fp8_lut_ptr is not None:
+                    v = _decode_fp8_lut(v, False, fp8_lut_ptr)
                 v = v.to(q.dtype)
                 if KV_SCALE_MODE == 1:
                     v = (v * tl.load(v_scale_ptr)).to(q.dtype)
@@ -287,6 +293,7 @@ def _gqa_sparse_decode_kernel(
     KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
     USE_PDL: tl.constexpr,
     VARLEN: tl.constexpr,
+    fp8_lut_ptr=None,  # pre-SM89 CUDA: e4m3 -> bf16 table for a uint8 cache view
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # split-K over the topk dimension: pid(0) folds (query-token, chunk).
@@ -367,6 +374,8 @@ def _gqa_sparse_decode_kernel(
             other=0.0,
         )
         if USE_FP8:
+            if fp8_lut_ptr is not None:
+                k = _decode_fp8_lut(k, False, fp8_lut_ptr)
             k = k.to(q.dtype)
             if KV_SCALE_MODE == 1:
                 k = (k * tl.load(k_scale_ptr)).to(q.dtype)
@@ -398,6 +407,8 @@ def _gqa_sparse_decode_kernel(
             other=0.0,
         )
         if USE_FP8:
+            if fp8_lut_ptr is not None:
+                v = _decode_fp8_lut(v, False, fp8_lut_ptr)
             v = v.to(q.dtype)
             if KV_SCALE_MODE == 1:
                 v = (v * tl.load(v_scale_ptr)).to(q.dtype)
@@ -561,6 +572,8 @@ def minimax_m3_sparse_attn(
     topk = topk_idx.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
     use_fp8 = kv_cache.dtype in _FP8_DTYPES
+    kv_cache, fp8_lut = e4m3fn_cache_as_u8(kv_cache)
+    fp8_kwargs = {} if fp8_lut is None else {"fp8_lut_ptr": fp8_lut}
     (
         k_scale_arg,
         v_scale_arg,
@@ -623,6 +636,7 @@ def minimax_m3_sparse_attn(
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         USE_FP8=use_fp8,
         KV_SCALE_MODE=kv_scale_mode,
+        **fp8_kwargs,
     )
 
 
@@ -658,6 +672,8 @@ def minimax_m3_sparse_attn_decode(
     max_topk = topk_idx.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
     use_fp8 = kv_cache.dtype in _FP8_DTYPES
+    kv_cache, fp8_lut = e4m3fn_cache_as_u8(kv_cache)
+    fp8_kwargs = {} if fp8_lut is None else {"fp8_lut_ptr": fp8_lut}
     (
         k_scale_arg,
         v_scale_arg,
@@ -744,6 +760,7 @@ def minimax_m3_sparse_attn_decode(
         USE_PDL=use_pdl,
         VARLEN=varlen,
         **pdl_launch,
+        **fp8_kwargs,
     )
     merge_grid = (total_q, num_heads)
     _merge_topk_attn_out_kernel[merge_grid](

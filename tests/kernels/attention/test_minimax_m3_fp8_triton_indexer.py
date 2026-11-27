@@ -34,7 +34,8 @@ else:
         minimax_m3_index_topk,
     )
 
-    FP8_SUPPORTED = current_platform.is_cuda() and current_platform.supports_fp8()
+    # CUDA below SM89 scores through the fp8_sm80 table decode.
+    FP8_SUPPORTED = current_platform.is_cuda()
 FP8_DTYPE = current_platform.fp8_dtype()
 PAGE = SPARSE_BLOCK_SIZE
 HEAD_DIM = 128
@@ -121,6 +122,46 @@ def test_fp8_index_query_and_cache_prefill_topk_matches_bf16() -> None:
         return {int(b) for b in idx[0, 0].tolist() if b >= 0}
 
     _check_selection(select(keys), select(keys.to(FP8_DTYPE)))
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_cuda() and FP8_SUPPORTED), reason="CUDA fp8 scorers"
+)
+@torch.inference_mode()
+def test_fp8_index_scores_match_bf16_scores_of_dequantized_operands() -> None:
+    """e4m3 is exact in bf16, so only fp32 summation order may differ.
+
+    Pins the table decode used below SM89 (and the native fp8 dot elsewhere)
+    to the bf16 scorer, for the prefill and the decode kernel.
+    """
+    from vllm.models.minimax_m3.common.ops.index_topk import (
+        minimax_m3_index_decode_score,
+    )
+
+    dev = "cuda"
+    q, keys = _make_inputs(dev)
+    block_table = torch.arange(NUM_PAGES, dtype=torch.int32, device=dev).unsqueeze(0)
+    seq_lens = torch.tensor([SEQ_LEN], dtype=torch.int32, device=dev)
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=dev)
+    prefix_lens = torch.tensor([SEQ_LEN - 1], dtype=torch.int32, device=dev)
+    q_fp8, keys_fp8 = q.to(FP8_DTYPE), keys.to(FP8_DTYPE)
+    num_blocks = -(-SEQ_LEN // PAGE)
+
+    def scores(query: torch.Tensor, cache: torch.Tensor) -> list[torch.Tensor]:
+        cache = cache.view(NUM_PAGES, PAGE, HEAD_DIM).contiguous()
+        prefill = minimax_m3_index_score(
+            query, cache, block_table, cu_seqlens_q, seq_lens, prefix_lens, 1,
+            SEQ_LEN, HEADS,
+        )  # fmt: skip
+        decode = minimax_m3_index_decode_score(
+            query, cache, block_table, seq_lens, SEQ_LEN, 0, 0, HEADS, 1, 1
+        )
+        return [prefill[..., :num_blocks], decode[..., :num_blocks]]
+
+    got = scores(q_fp8, keys_fp8)
+    want = scores(q_fp8.to(torch.bfloat16), keys_fp8.to(torch.bfloat16))
+    for g, w in zip(got, want):
+        torch.testing.assert_close(g, w, rtol=1e-4, atol=1e-3)
 
 
 @pytest.mark.skipif(not FP8_SUPPORTED, reason="FP8 support required")

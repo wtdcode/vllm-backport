@@ -6,7 +6,10 @@ import torch
 
 from vllm.platforms import current_platform
 
-if not torch.cuda.is_available() or not current_platform.supports_fp8():
+# CUDA below SM89 runs the same kernels through the fp8_sm80 table decode.
+if not torch.cuda.is_available() or not (
+    current_platform.is_cuda() or current_platform.supports_fp8()
+):
     pytest.skip(
         "MiniMax-M3 FP8 sparse attention scale tests require an FP8 GPU.",
         allow_module_level=True,

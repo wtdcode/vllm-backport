@@ -19,6 +19,7 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
+from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_lut, e4m3fn_cache_as_u8
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -102,6 +103,7 @@ def _index_block_score_kernel(
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     USE_SPLIT_K: tl.constexpr,
+    fp8_lut_ptr=None,  # pre-SM89 CUDA: e4m3 -> bf16 table for a uint8 cache view
 ):
     pid_q = tl.program_id(0)
     pid_bh = tl.program_id(1)
@@ -166,7 +168,9 @@ def _index_block_score_kernel(
             + off_k[None, :] * stride_ik_pos
             + off_d[:, None] * stride_ik_d,
         )
-        if k.dtype.is_fp8() and k.dtype != q.dtype:
+        if fp8_lut_ptr is not None:
+            k = _decode_fp8_lut(k, False, fp8_lut_ptr)
+        elif k.dtype.is_fp8() and k.dtype != q.dtype:
             k = k.to(tl.bfloat16)
         qk = tl.dot(q, k, out_dtype=tl.float32)
         # apply causal mask as needed
@@ -339,6 +343,7 @@ def _decode_index_score_kernel(
     BLOCK_SIZE_Q: tl.constexpr,
     num_kv_chunks,
     USE_PDL: tl.constexpr,
+    fp8_lut_ptr=None,  # pre-SM89 CUDA: e4m3 -> bf16 table for a uint8 cache view
 ):
     BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
     pid_r = tl.program_id(0)
@@ -400,7 +405,9 @@ def _decode_index_score_kernel(
         # Matched fp8 operands keep the native FP8 MMA; any mismatch upcasts,
         # since no mixed-dtype fp8 MMA exists. FP32 accumulation preserves
         # score accuracy either way. BF16/FP32 loads stay as stored.
-        if k.dtype.is_fp8() and k.dtype != q.dtype:
+        if fp8_lut_ptr is not None:
+            k = _decode_fp8_lut(k, False, fp8_lut_ptr)
+        elif k.dtype.is_fp8() and k.dtype != q.dtype:
             k = k.to(tl.bfloat16)
         kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
         kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
@@ -670,6 +677,23 @@ def _topk_index_merge_kernel(
 # ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
+def _fp8_emulation_args(
+    idx_q: torch.Tensor, index_kv_cache: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Operands for CUDA below SM89, where Triton has no fp8 conversions.
+
+    The e4m3 index cache is read as bytes through a bf16 table and an e4m3
+    query is decoded up front; both are exact, so the scores match the native
+    fp8 path. A no-op wherever the hardware convert exists.
+    """
+    index_kv_cache, fp8_lut = e4m3fn_cache_as_u8(index_kv_cache)
+    if fp8_lut is None:
+        return idx_q, index_kv_cache, {}
+    if idx_q.dtype == torch.float8_e4m3fn:
+        idx_q = idx_q.to(torch.bfloat16)
+    return idx_q, index_kv_cache, {"fp8_lut_ptr": fp8_lut}
+
+
 @torch.no_grad()
 def minimax_m3_index_score(
     idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
@@ -691,6 +715,7 @@ def minimax_m3_index_score(
     assert num_idx_heads == num_kv_heads, (
         "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     )
+    idx_q, index_kv_cache, fp8_kwargs = _fp8_emulation_args(idx_q, index_kv_cache)
     batch = cu_seqlens_q.shape[0] - 1
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
 
@@ -740,6 +765,7 @@ def minimax_m3_index_score(
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         USE_SPLIT_K=split_k > 1,
+        **fp8_kwargs,
     )
     return score
 
@@ -825,6 +851,7 @@ def minimax_m3_index_decode_score(
     )
     assert decode_query_len <= max_decode_query_len
     assert total_q == seq_lens.shape[0] * decode_query_len
+    idx_q, index_kv_cache, fp8_kwargs = _fp8_emulation_args(idx_q, index_kv_cache)
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     use_pdl = current_platform.is_arch_support_pdl()
     # `launch_pdl` is a Triton runtime kwarg only some backends accept (CUDA
@@ -891,6 +918,7 @@ def minimax_m3_index_decode_score(
         num_kv_chunks=num_kv_chunks,
         USE_PDL=use_pdl,
         **score_kwargs,
+        **fp8_kwargs,
     )
     return score
 

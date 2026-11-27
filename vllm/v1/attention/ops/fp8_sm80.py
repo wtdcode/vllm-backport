@@ -171,3 +171,17 @@ def _decode_fp8_lut(u, USE_FNUZ: tl.constexpr, lut_ptr):
         return u.to(tl.float8e4nv, bitcast=True).to(tl.float32)
     else:
         return tl.load(lut_ptr + u.to(tl.uint32))
+
+
+def e4m3fn_cache_as_u8(
+    cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Kernel-ready `(cache, lut)` for an fp8 cache read by a Triton kernel.
+
+    Pre-SM89 CUDA gets a uint8 view of an e4m3fn cache plus the bf16 table
+    for `_decode_fp8_lut`; everything else is returned unchanged with no
+    table, so the kernel keeps its native fp8 load.
+    """
+    if cache.dtype != torch.float8_e4m3fn or native_fp8_cast_supported():
+        return cache, None
+    return cache.view(torch.uint8), get_e4m3fn_bf16_lut(cache.device)

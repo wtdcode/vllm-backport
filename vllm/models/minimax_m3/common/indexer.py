@@ -557,8 +557,8 @@ def select_indexer_impl_cls(
     Q8KV4/Q8KV8 paged indexers (SM100/SM103/SM107 only). On SM90 and SM120/SM121, the
     flashinfer.msa_ops impl is used when the caller passes the
     `minimax_m3_use_flashinfer_msa` verdict. Everything else falls back to
-    the Triton indexer, with fp8 restricted to CUDA platforms that advertise fp8
-    support and to ROCm gfx942 (MI300-series, CDNA3). gfx950 (MI350-series)
+    the Triton indexer, with fp8 restricted to CUDA (emulated below SM89) and
+    to ROCm gfx942 (MI300-series, CDNA3). gfx950 (MI350-series)
     takes the fp8 path through the AITER indexer instead, so this fallback
     stays bf16-only there.
     """
@@ -608,7 +608,8 @@ def select_indexer_impl_cls(
 
             fp8_ok = on_gfx942()
         else:
-            fp8_ok = is_cuda and current_platform.supports_fp8()
+            # Below SM89 the Triton scorers decode e4m3 through a table.
+            fp8_ok = is_cuda
         if not fp8_ok:
             raise NotImplementedError(
                 f"indexer_kv_dtype={indexer_kv_dtype!r} requires CUDA fp8 "
