@@ -58,6 +58,8 @@ logger = init_logger(__name__)
 
 class DSparkSpeculator(DFlashSpeculator):
     _speculator_name = "DSpark"
+    # Set per instance in __init__; off for objects built without it.
+    use_local_argmax_reduction: bool = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)

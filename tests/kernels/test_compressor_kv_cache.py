@@ -37,6 +37,7 @@ from vllm.utils.import_utils import is_cutedsl_supported
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
+from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     cp_gather_indexer_k_quant_cache_triton,
     indexer_k_quant_and_cache_triton,
@@ -68,8 +69,8 @@ def test_pipeline_cache_relay_matches_direct_insert(
     )
 
     indexer = row_bytes in (132, 68)
-    if row_bytes in (288, 68) and not current_platform.is_device_capability_family(100):
-        pytest.skip("FP4 cache writer test requires an SM100-family GPU")
+    if row_bytes == 68 and not current_platform.is_device_capability_family(100):
+        pytest.skip("MXFP4 index key writer test requires an SM100-family GPU")
     torch.manual_seed(0)
     block_size = 32
     num_blocks = math.ceil(num_tokens / block_size) + 1
@@ -992,7 +993,7 @@ def _per_token_nvfp4_gather_kernel(
         mag = tl.where(mag_code < 2, m * 0.5, (1.0 + m * 0.5) * tl.exp2(e - 1.0))
         vals = tl.where(codes >= 8, -mag, mag)
         sf = tl.load(token_ptr + 256 + tl.arange(0, 32))
-        scale = sf.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        scale = _decode_fp8_f32(sf, False)
         dequant = tl.reshape(tl.reshape(vals, (32, 16)) * scale[:, None], (512,))
         out_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
         tl.store(out_row_ptr + d, dequant.to(tl.bfloat16))

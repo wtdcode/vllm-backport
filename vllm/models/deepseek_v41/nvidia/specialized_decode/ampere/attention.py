@@ -26,6 +26,7 @@ import torch
 
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
+from vllm.lora.layers.custom_layer import DeepseekV4GroupedWoAWithLoRA
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.models.deepseek_v41.attention import (
     DeepseekV4Attention,
@@ -128,6 +129,8 @@ class DeepseekV41AmpereAttention(DeepseekV4Attention):
     backend_cls = AmpereSparseMLABackend
     swa_backend_cls = AmpereSWABackend
     compressor_cls = AmpereCompressor
+    # The 288-byte NVFP4 records and 68-byte MXFP4 index keys, as on SM100.
+    supports_pipeline_relay = True
 
     @property
     def packed_kv_cache_dtype(self) -> CacheDType:
@@ -145,7 +148,8 @@ class DeepseekV41AmpereAttention(DeepseekV4Attention):
         """The indexer with SM80 query quantization and logits."""
         return AmpereIndexer
 
-    def _indexer_cache_cls(self) -> type[DeepseekV4IndexerCache]:
+    @classmethod
+    def _indexer_cache_cls(cls) -> type[DeepseekV4IndexerCache]:
         """The index K cache with the SM80 indexer metadata."""
         return AmpereIndexerCache
 
@@ -170,7 +174,11 @@ class DeepseekV41AmpereAttention(DeepseekV4Attention):
         groups = self.n_local_groups
         o = attn_out.view(num_tokens, groups, -1).transpose(0, 1)
         z = torch.bmm(o, weight.view(groups, self.o_lora_rank, -1).transpose(1, 2))
-        return self._wo_b_proj(z.transpose(0, 1).reshape(num_tokens, -1))
+        z = z.transpose(0, 1)
+        if isinstance(self.wo_a, DeepseekV4GroupedWoAWithLoRA):
+            # The BMM reads the base weight, so the adapter is added here.
+            self.wo_a.add_grouped_lora(z, attn_out.view(num_tokens, groups, -1))
+        return self._wo_b_proj(z.reshape(num_tokens, -1))
 
     def forward_mqa(
         self,

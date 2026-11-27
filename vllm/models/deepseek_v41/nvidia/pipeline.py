@@ -158,12 +158,12 @@ class PipelineRelay(nn.Module):
         prefix: str,
         incoming: PipelineBoundary,
         outgoing: PipelineBoundary,
+        attn_cls: type[DeepseekV4Attention],
     ):
         from vllm.models.deepseek_v41.attention import (
-            DeepseekV4IndexerCache,
             _indexer_k_cache_head_dim,
+            _indexer_uses_fp4,
         )
-        from vllm.v1.attention.backends.mla.indexer import dsa_indexer_uses_fp4
 
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -175,7 +175,7 @@ class PipelineRelay(nn.Module):
         self.index_cache: DeepseekV4IndexerCache | None = None
         self.main_row_bytes = 0
         self.index_row_bytes = _indexer_k_cache_head_dim(
-            self.config.index_head_dim, dsa_indexer_uses_fp4(vllm_config)
+            self.config.index_head_dim, _indexer_uses_fp4(vllm_config)
         )
         if incoming.kv_source is not None:
             self.main_cache = PipelineCache(
@@ -183,7 +183,8 @@ class PipelineRelay(nn.Module):
             )
         if incoming.indexer_k_source is not None:
             source = incoming.indexer_k_source
-            self.index_cache = DeepseekV4IndexerCache(
+            # The layers' own cache class: it names their metadata builder.
+            self.index_cache = attn_cls._indexer_cache_cls()(
                 head_dim=self.index_row_bytes,
                 dtype=torch.uint8,
                 prefix=f"{prefix}.layers.{source}.attn.indexer.k_cache",

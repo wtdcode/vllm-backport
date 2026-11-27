@@ -240,7 +240,7 @@ def _prefill_topk(
         if chunk.local_total_seq_lens == 0 or row_end == row_start:
             topk.fill_(-1)
             continue
-        step = dense_logits_rows(chunk.max_seqlen_k)
+        step = min(dense_logits_rows(chunk.max_seqlen_k), logits_kernels.MAX_ROWS)
         for sub in range(0, row_end - row_start, step):
             rows = slice(sub, min(sub + step, row_end - row_start))
             tokens = slice(row_start + rows.start, row_start + rows.stop)

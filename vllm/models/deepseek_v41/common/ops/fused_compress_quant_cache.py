@@ -7,12 +7,27 @@ import torch
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import _fp32x2_to_fp4x2
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_e4m3fn_u8
+from vllm.v1.attention.ops.fp8_sm80 import (
+    _NATIVE_FP4_CAST,
+    _decode_fp8_f32,
+    _encode_e4m3fn_u8,
+    _f32_to_e2m1_u8,
+)
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
 else:
     _ON_GFX950 = False
+
+
+@triton.jit
+def _encode_fp4x2_u8(x_lo, x_hi):
+    """Drop-in for `_fp32x2_to_fp4x2` below SM100, which lacks its convert."""
+    if _NATIVE_FP4_CAST:
+        return _fp32x2_to_fp4x2(x_lo, x_hi)
+    else:
+        return _f32_to_e2m1_u8(x_lo) | (_f32_to_e2m1_u8(x_hi) << 4)
+
 
 # The ring and raw rows a ratio-2 request program pools are not adjacent, so
 # reading them as one tile means joining two pointers. ROCm's Triton fails to
@@ -521,6 +536,10 @@ def rope_quant_insert(
         assert kernel is not None, (
             f"unsupported paged KV record width {kv_cache.shape[-1]}"
         )
+        if kv_cache.shape[-1] == 288 and not _NATIVE_FP4_CAST.value:
+            # Round each RoPE product, as the SM80 CuTe DSL writer does: the
+            # two share their caches.
+            launch_kwargs = {**launch_kwargs, "enable_fp_fusion": False}
         kernel[(num_tokens,)](
             latent,
             positions,
@@ -734,6 +753,10 @@ def _rope_quant_insert_nvfp4_kernel(
     rotated = tl.interleave(even * c - odd * s, odd * c + even * s)
     if SANITIZE_CACHE_NANS:
         rotated = tl.where(rotated == rotated, rotated, 0.0)
+    if not _NATIVE_FP4_CAST:
+        # The identity rotation turns a NoPE -0 into +0; keep its sign bit,
+        # as the SM80 CuTe DSL writer of this record does.
+        rotated = tl.where(d < 448, normed, rotated)
 
     tiles = tl.reshape(rotated, (32, 16))
     amax = tl.max(tl.abs(tiles), 1)
@@ -746,7 +769,7 @@ def _rope_quant_insert_nvfp4_kernel(
 
     page = cache + (slot // CACHE_BLOCK).to(tl.int64) * CACHE_STRIDE
     values = page + (slot % CACHE_BLOCK) * 288
-    tl.store(values + tl.arange(0, 256), _fp32x2_to_fp4x2(lo, hi))
+    tl.store(values + tl.arange(0, 256), _encode_fp4x2_u8(lo, hi))
     tl.store(values + 256 + tl.arange(0, 32), scale)
 
 

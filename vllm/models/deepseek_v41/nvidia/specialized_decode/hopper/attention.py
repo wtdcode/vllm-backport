@@ -71,6 +71,8 @@ class DeepseekV41HopperAttention(DeepseekV4FlashMLAAttention):
     """DeepSeek-V4.1 attention on SM90 with CuTe DSL decode attention."""
 
     swa_backend_cls = HopperSWABackend
+    # Not validated with this layer's decode attention and indexer metadata.
+    supports_pipeline_relay = False
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -86,7 +88,8 @@ class DeepseekV41HopperAttention(DeepseekV4FlashMLAAttention):
         """The indexer with compact candidate consumers on decode steps."""
         return HopperIndexer
 
-    def _indexer_cache_cls(self) -> type[DeepseekV4IndexerCache]:
+    @classmethod
+    def _indexer_cache_cls(cls) -> type[DeepseekV4IndexerCache]:
         """The index K cache with the SM90 indexer metadata."""
         return HopperIndexerCache
 

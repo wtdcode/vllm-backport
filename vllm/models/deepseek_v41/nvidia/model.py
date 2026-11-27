@@ -849,18 +849,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             else ()
         )
         needs_relay = any(boundary.needs_relay for boundary in boundaries)
+        attn_cls = _select_dsv4_attn_cls(vllm_config)
         if needs_relay and (
             self.parallel_config.prefill_context_parallel_size != 1
             or self.parallel_config.decode_context_parallel_size != 1
             or self.parallel_config.use_ubatching
             or vllm_config.speculative_config is not None
             or vllm_config.kv_transfer_config is not None
-            or _select_dsv4_attn_cls(vllm_config)
-            not in (DeepseekV4FlashMLAAttention, DeepseekV4MegaAttnAttention)
+            or not attn_cls.supports_pipeline_relay
         ):
             raise NotImplementedError(
                 "DeepSeek-V4.1 cross-stage cache relay requires packed FlashMLA "
-                "caches and PCP=DCP=1, without microbatching, "
+                "or SM80 caches and PCP=DCP=1, without microbatching, "
                 "speculative decoding or KV transfer."
             )
         pp_rank = get_pp_group().rank_in_group if needs_relay else 0
@@ -870,6 +870,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 prefix,
                 boundaries[pp_rank - 1] if pp_rank > 0 else PipelineBoundary(),
                 boundaries[pp_rank] if pp_rank < pp_size - 1 else PipelineBoundary(),
+                attn_cls,
             )
             if needs_relay
             else None

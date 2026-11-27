@@ -3704,6 +3704,226 @@ def _sparse_attn_decode_partial_kernel(
 
 
 @triton.jit
+def _load_v41_mxfp8_keys(
+    cache_ptr,
+    slot,
+    valid,
+    cache_stride0,
+    block_size,
+    fp8_lut_ptr,
+    BLOCK_K: tl.constexpr,
+):
+    """BF16 `[BLOCK_K, 512]` keys of V4.1 MXFP8 records: 512 e4m3 values,
+    then 16 UE8M0 scales of 32 dims, 528 B a token."""
+    token_ptr = (
+        cache_ptr
+        + (slot // block_size).to(tl.int64) * cache_stride0
+        + (slot % block_size) * 528
+    )
+    values = tl.load(
+        token_ptr[:, None] + tl.arange(0, 512)[None, :], mask=valid[:, None], other=0
+    )
+    values = _decode_fp8_lut(values, False, fp8_lut_ptr).to(tl.bfloat16)
+    encoded = tl.load(
+        token_ptr[:, None] + 512 + tl.arange(0, 16)[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    # The UE8M0 byte is the exponent field: bits 14:7 of a BF16.
+    scales = (encoded.to(tl.int16) << 7).to(tl.bfloat16, bitcast=True)
+    scales = tl.broadcast_to(scales[:, :, None], (BLOCK_K, 16, 32))
+    keys = values * tl.reshape(scales, (BLOCK_K, 512))
+    return tl.where(keys == keys, keys, 0.0)
+
+
+@triton.jit
+def _load_v41_nvfp4_keys(
+    cache_ptr,
+    slot,
+    valid,
+    cache_stride0,
+    block_size,
+    fp8_lut_ptr,
+    BLOCK_K: tl.constexpr,
+):
+    """BF16 `[BLOCK_K, 512]` keys of V4.1 NVFP4 records: 256 B of e2m1 pairs
+    (even element in the low nibble), then 32 e4m3 scales of 16 dims, 288 B a
+    token. Exact: a nibble placed as FP16 bits reads as e2m1 * 2^-14, and its
+    product with the scale has at most six significant bits."""
+    token_ptr = (
+        cache_ptr
+        + (slot // block_size).to(tl.int64) * cache_stride0
+        + (slot % block_size) * 288
+    )
+    packed = tl.load(
+        token_ptr[:, None] + tl.arange(0, 256)[None, :], mask=valid[:, None], other=0
+    ).to(tl.int32)
+    lo = packed & 0xF
+    hi = packed >> 4
+    lo = ((lo & 7) << 9) | ((lo & 8) << 12)
+    hi = ((hi & 7) << 9) | ((hi & 8) << 12)
+    lo = lo.to(tl.int16).to(tl.float16, bitcast=True)
+    hi = hi.to(tl.int16).to(tl.float16, bitcast=True)
+    values = tl.interleave(lo, hi).to(tl.float32)
+    encoded = tl.load(
+        token_ptr[:, None] + 256 + tl.arange(0, 32)[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    scales = _decode_fp8_lut(encoded, False, fp8_lut_ptr).to(tl.float32) * 16384.0
+    scales = tl.broadcast_to(scales[:, :, None], (BLOCK_K, 32, 16))
+    keys = (values * tl.reshape(scales, (BLOCK_K, 512))).to(tl.bfloat16)
+    return tl.where(keys == keys, keys, 0.0)
+
+
+@triton.jit
+def _sparse_attn_decode_v41_partial_kernel(
+    q_ptr,
+    main_cache_ptr,
+    main_indices_ptr,
+    main_indptr_ptr,
+    extra_cache_ptr,
+    extra_indices_ptr,
+    extra_indptr_ptr,
+    part_m_ptr,
+    part_l_ptr,
+    part_acc_ptr,
+    fp8_lut_ptr,
+    q_stride0,
+    q_stride1,
+    main_cache_stride0,
+    extra_cache_stride0,
+    pm_stride0,
+    pm_stride_s,
+    pa_stride0,
+    pa_stride_s,
+    pa_stride_h,
+    main_num_rows,
+    extra_num_rows,
+    main_block_size,
+    extra_block_size,
+    scale,
+    num_heads,
+    HAS_EXTRA: tl.constexpr,
+    # The compressed cache holds NVFP4 (288 B) records; else MXFP8 (528 B).
+    EXTRA_NVFP4: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """`_sparse_attn_decode_partial_kernel` over DeepSeek's V4.1 records:
+    the MXFP8 sliding-window cache and an NVFP4 or MXFP8 compressed cache,
+    all 512 dims of a key in one tile. Same partial state layout."""
+    query_idx = tl.program_id(0)
+    split_id = tl.program_id(1)
+    pid_h = tl.program_id(2)
+
+    head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head_offsets < num_heads
+    dims = tl.arange(0, 512)
+    q = tl.load(
+        q_ptr
+        + query_idx * q_stride0
+        + head_offsets[:, None] * q_stride1
+        + dims[None, :],
+        mask=head_mask[:, None],
+        other=0.0,
+    )
+
+    neg_large = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, 512), dtype=tl.float32)
+    k_offsets = tl.arange(0, BLOCK_K)
+
+    main_start = tl.load(main_indptr_ptr + query_idx)
+    main_len = tl.load(main_indptr_ptr + query_idx + 1) - main_start
+    main_chunk = (main_len + NUM_SPLITS - 1) // NUM_SPLITS
+    main_lo = split_id * main_chunk
+    main_hi = tl.minimum(main_lo + main_chunk, main_len)
+
+    for k_start in tl.range(main_lo, main_hi, BLOCK_K, num_stages=NUM_STAGES):
+        k_pos = k_start + k_offsets
+        in_range = k_pos < main_hi
+        slot = tl.load(main_indices_ptr + main_start + k_pos, mask=in_range, other=-1)
+        valid = in_range & (slot >= 0) & (slot < main_num_rows)
+        keys = _load_v41_mxfp8_keys(
+            main_cache_ptr,
+            tl.where(valid, slot, 0),
+            valid,
+            main_cache_stride0,
+            main_block_size,
+            fp8_lut_ptr,
+            BLOCK_K,
+        )
+        scores = tl.dot(q, tl.trans(keys)) * scale
+        scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), keys)
+        m_i = m_new
+
+    if HAS_EXTRA:
+        extra_start = tl.load(extra_indptr_ptr + query_idx)
+        extra_len = tl.load(extra_indptr_ptr + query_idx + 1) - extra_start
+        extra_chunk = (extra_len + NUM_SPLITS - 1) // NUM_SPLITS
+        extra_lo = split_id * extra_chunk
+        extra_hi = tl.minimum(extra_lo + extra_chunk, extra_len)
+
+        for k_start in tl.range(extra_lo, extra_hi, BLOCK_K, num_stages=NUM_STAGES):
+            k_pos = k_start + k_offsets
+            in_range = k_pos < extra_hi
+            slot = tl.load(
+                extra_indices_ptr + extra_start + k_pos, mask=in_range, other=-1
+            )
+            valid = in_range & (slot >= 0) & (slot < extra_num_rows)
+            if EXTRA_NVFP4:
+                keys = _load_v41_nvfp4_keys(
+                    extra_cache_ptr,
+                    tl.where(valid, slot, 0),
+                    valid,
+                    extra_cache_stride0,
+                    extra_block_size,
+                    fp8_lut_ptr,
+                    BLOCK_K,
+                )
+            else:
+                keys = _load_v41_mxfp8_keys(
+                    extra_cache_ptr,
+                    tl.where(valid, slot, 0),
+                    valid,
+                    extra_cache_stride0,
+                    extra_block_size,
+                    fp8_lut_ptr,
+                    BLOCK_K,
+                )
+            scores = tl.dot(q, tl.trans(keys)) * scale
+            scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
+            m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+            p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), keys)
+            m_i = m_new
+
+    pm_base = query_idx * pm_stride0 + split_id * pm_stride_s + head_offsets
+    tl.store(part_m_ptr + pm_base, m_i, mask=head_mask)
+    tl.store(part_l_ptr + pm_base, l_i, mask=head_mask)
+    acc_base = (
+        part_acc_ptr
+        + query_idx * pa_stride0
+        + split_id * pa_stride_s
+        + head_offsets[:, None] * pa_stride_h
+    )
+    tl.store(acc_base + dims[None, :], acc, mask=head_mask[:, None])
+
+
+@triton.jit
 def _sparse_attn_decode_gfx950_partial_loaded_tile(
     q_combined,
     cache_ptr,
@@ -5492,6 +5712,45 @@ def _rocm_sparse_attn_decode_ragged_triton(
             NUM_STAGES=1,
             num_warps=4,
             waves_per_eu=0,
+        )
+    elif main_cache.shape[-1] == 528:
+        # DeepSeek's V4.1 records: MXFP8 window, NVFP4 or MXFP8 compressed.
+        assert not is_fnuz and nope_head_dim + rope_head_dim == 512
+        assert extra_cache.shape[-1] in (288, 528)
+        _sparse_attn_decode_v41_partial_kernel[(num_queries, num_splits, heads_blocks)](
+            q,
+            main_cache,
+            main_indices,
+            main_indptr,
+            extra_cache,
+            extra_indices,
+            extra_indptr,
+            part_m,
+            part_l,
+            part_acc,
+            fp8_lut,
+            q.stride(0),
+            q.stride(1),
+            main_cache.stride(0),
+            extra_cache.stride(0),
+            part_m.stride(0),
+            part_m.stride(1),
+            part_acc.stride(0),
+            part_acc.stride(1),
+            part_acc.stride(2),
+            main_cache.shape[0] * main_cache.shape[1],
+            extra_cache.shape[0] * extra_cache.shape[1],
+            main_cache.shape[1],
+            extra_cache.shape[1],
+            scale,
+            num_heads,
+            HAS_EXTRA=has_extra,
+            EXTRA_NVFP4=extra_cache.shape[-1] == 288,
+            BLOCK_H=block_h,
+            BLOCK_K=block_k,
+            NUM_SPLITS=num_splits,
+            NUM_STAGES=1,
+            num_warps=_DECODE_PARTIAL_NUM_WARPS,
         )
     else:
         _sparse_attn_decode_partial_kernel[(num_queries, num_splits, heads_blocks)](

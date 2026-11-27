@@ -747,7 +747,10 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             self._index_source_prefix = _replace_layer_index(
                 self.prefix, self.index_source_layer_id
             )
-            if self._index_source_prefix not in self._static_forward_context:
+            if (
+                self._index_source_prefix not in self._static_forward_context
+                and not self.supports_pipeline_relay
+            ):
                 raise NotImplementedError(
                     f"Index source {self._index_source_prefix} not found on "
                     "this rank; PP splits inside a v4.1 index-sharing group "

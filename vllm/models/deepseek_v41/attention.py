@@ -199,15 +199,17 @@ def _indexer_k_cache_head_dim(index_head_dim: int, use_fp4_kv: bool) -> int:
 # bytes -- only in its SM100 sparse-decode kernels. Every other arch keeps the
 # V4 record: 448 fp8 NoPE + 64 bf16 RoPE plus 7 UE8M0 scales of 64 dims and a
 # pad byte (584 B, 576 B pages). The Ampere kernels decode the V4.1 records
-# too (nvidia/specialized_decode/ampere).
-def _use_v41_mxfp8_kv_record() -> bool:
+# too (nvidia/specialized_decode/ampere), and the SM8x Triton route reads them
+# when `kv_cache_dtype` asks for the NVFP4 compressed cache (ampere).
+def _use_v41_mxfp8_kv_record(kv_cache_dtype: str | None = None) -> bool:
     if current_platform.is_device_capability_family(100):
         return True
     if not current_platform.is_cuda():
         return False
+    from vllm.models.deepseek_v41.ampere import triton_reads_v41_records
     from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere import is_ampere
 
-    return is_ampere()
+    return is_ampere() or triton_reads_v41_records(kv_cache_dtype)
 
 
 def _indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
@@ -292,6 +294,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # The compressor of kv-source layers; a platform subclass swaps in one
     # that writes its compressed KV record with its own kernel.
     compressor_cls: ClassVar[type[DeepseekCompressor]] = DeepseekCompressor
+    # Whether pipeline stages can relay the layer's compressed KV and index K
+    # rows (nvidia/pipeline.py): packed records that
+    # `copy_pipeline_cache_rows` moves, read through their source's cache layer.
+    supports_pipeline_relay: ClassVar[bool] = False
     # Whether the layer's kernels clamp to the replay start, so its
     # sliding-window cache can stay out of prefix caching.
     supports_swa_bounded_replay: ClassVar[bool] = True
@@ -372,7 +378,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         returns one that writes and scores its own cache layout."""
         return DeepseekV4Indexer
 
-    def _indexer_cache_cls(self) -> type["DeepseekV4IndexerCache"]:
+    @classmethod
+    def _indexer_cache_cls(cls) -> type["DeepseekV4IndexerCache"]:
         """The index K cache layer, which names the indexer metadata
         backend. A platform subclass returns one with its own builder."""
         return DeepseekV4IndexerCache
@@ -610,7 +617,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             cache_config,
             self.packed_kv_cache_dtype,
         )
-        self.kv_mxfp8 = _use_v41_mxfp8_kv_record()
+        self.kv_mxfp8 = _use_v41_mxfp8_kv_record(self.kv_cache_dtype)
         self.swa_bytes_per_token = 528 if self.kv_mxfp8 else 584
         # nvfp4_ds_mla keeps the MXFP8 sliding-window record and stores the
         # compressed cache as NVFP4 (256 B of e2m1 pairs + 32 e4m3 scales).
@@ -1378,9 +1385,8 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             "fp8_ds_mla",
             "nvfp4_ds_mla",
         )
-        page_alignment = (
-            576 if uses_fp8_ds_mla_layout and not _use_v41_mxfp8_kv_record() else 512
-        )
+        kv_mxfp8 = _use_v41_mxfp8_kv_record(vllm_config.cache_config.cache_dtype)
+        page_alignment = 576 if uses_fp8_ds_mla_layout and not kv_mxfp8 else 512
         spec = MLAAttentionSpec(
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
@@ -1398,9 +1404,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             block_stride_alignment=(
                 math.lcm(
                     256,
-                    1
-                    if uses_fp8_ds_mla_layout and _use_v41_mxfp8_kv_record()
-                    else page_alignment,
+                    1 if uses_fp8_ds_mla_layout and kv_mxfp8 else page_alignment,
                 )
                 if self.sparse_logits
                 and not self.rocm_mxfp4

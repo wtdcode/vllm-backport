@@ -1087,6 +1087,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             return AttentionCGSupport.ALWAYS
         return AttentionCGSupport.UNIFORM_BATCH
 
+    def _indexer_uses_fp4(self) -> bool:
+        """Whether the index K cache is MXFP4. A platform builder with its
+        own MXFP4 kernels decides it itself."""
+        return dsa_indexer_uses_fp4(self.vllm_config)
+
     def __init__(self, *args, block_table_width: int, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         scheduler_config = self.vllm_config.scheduler_config
@@ -1149,7 +1154,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             self.vllm_config.speculative_config
             and self.vllm_config.speculative_config.enable_adaptive_verification
         )
-        self.indexer_uses_fp4 = dsa_indexer_uses_fp4(self.vllm_config)
+        self.indexer_uses_fp4 = self._indexer_uses_fp4()
         # Plan prefill chunks for the fused MQA+top-k kernel (not bounded by
         # the logits budget). v4.1 candidate selection is not excluded: its
         # pre-candidate indexers take fused_mqa_topk and the others row-split

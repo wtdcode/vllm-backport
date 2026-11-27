@@ -15,7 +15,8 @@
   split over CTAs or walked by one (several chunks per CTA), empty rows,
   unselected (-1) entries, window-only layers, padded cache pages and head
   counts that do not fill a CTA's 8 or 16 heads; and its V4-record variant
-  (SM90's caches) without the inverse RoPE.
+  (SM90's caches) without the inverse RoPE; a prefill step past 65535 tokens;
+* a pipeline stage's relay of the compressed records and index keys.
 
 The kernels use SM80 instructions only, so any SM80-or-newer GPU runs them;
 about a minute, most of it compilation.
@@ -200,6 +201,46 @@ def test_ragged_logits(heads):
     for row in range(rows):
         want[row, : ends[row] - starts[row]] = full[row, starts[row] : ends[row]]
     _assert_rows_close(got, want, ends - starts, 1e-4)
+
+
+@pytest.mark.parametrize("record", [288, 68])
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_pipeline_relay(cos_sin, record, ratio):
+    """A pipeline stage's relayed compressed records and index keys equal the
+    SM80 writers' own at the receiver's slots (the keys' scales follow their
+    page's values)."""
+    from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
+        copy_pipeline_cache_rows,
+    )
+    from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere import quantize
+
+    block_size, blocks, tokens = 32, 10, 200
+    source, target, want = (_paged(blocks, block_size, record, 64) for _ in range(3))
+    dim = 512 if record == 288 else 128
+    x = (torch.randn(tokens, dim, device=DEVICE) * 3).bfloat16()
+    positions = torch.arange(tokens, device=DEVICE) + 1
+    slots = torch.randperm(blocks * block_size, device=DEVICE)[:tokens]
+    slots[7] = -1
+    moved = torch.where(slots >= 0, blocks * block_size - 1 - slots, -1)
+    norm_weight = (torch.rand(128, device=DEVICE) + 0.5).bfloat16()
+
+    def write(cache, slot_mapping):
+        if record == 288:
+            quantize.store_compressed_records(
+                x, positions, slot_mapping, cos_sin, ratio, cache
+            )
+        else:
+            quantize.store_index_keys(
+                x, positions, slot_mapping, norm_weight, 1e-6, cos_sin, ratio, cache
+            )
+
+    write(source, slots)
+    write(want, moved)
+    rows = torch.empty(tokens, record, dtype=torch.uint8, device=DEVICE)
+    copy_pipeline_cache_rows(source, rows, positions, slots, ratio, scatter=False)
+    copy_pipeline_cache_rows(target, rows, positions, moved, ratio, scatter=True)
+    assert want.any()
+    torch.testing.assert_close(target, want, rtol=0, atol=0)
 
 
 def _index_key_cache(blocks: int, block_size: int) -> torch.Tensor:
@@ -535,6 +576,29 @@ def test_sparse_mla(cos_sin, tokens, heads, splits, empty, window_only):
     want = reference.sparse_mla(*args)
     got = torch.full_like(q, float("nan"))
     sparse_mla.sparse_mla(*args, got, splits=splits)
+    assert not got.isnan().any()
+    assert (got.float() - want.float()).abs().max() < 2e-2 * want.float().abs().max()
+
+
+def test_sparse_mla_long_prefill(cos_sin):
+    """More tokens in one launch than a CUDA grid's y or z dimension holds."""
+    from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere import sparse_mla
+
+    torch.manual_seed(0)
+    tokens, heads, window = 65536 + 70, 8, 64
+    swa = _paged(40, 32, 528, 512 - (32 * 528) % 512)
+    _fill_window_cache(swa)
+    q = torch.randn(tokens, heads, 512, device=DEVICE).bfloat16()
+    swa_indices = torch.randint(
+        0, 40 * 32, (tokens, window), device=DEVICE, dtype=torch.int32
+    )
+    swa_lens = torch.randint(1, window + 1, (tokens,), device=DEVICE, dtype=torch.int32)
+    sink = torch.randn(heads, device=DEVICE)
+    positions = torch.randint(0, 4096, (tokens,), device=DEVICE)
+    args = (q, swa, swa_indices, swa_lens, None, None, None, sink, 512**-0.5)
+    want = reference.sparse_mla(*args, positions, cos_sin, chunk=4096)
+    got = torch.full_like(q, float("nan"))
+    sparse_mla.sparse_mla(*args, positions, cos_sin, got)
     assert not got.isnan().any()
     assert (got.float() - want.float()).abs().max() < 2e-2 * want.float().abs().max()
 

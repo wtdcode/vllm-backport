@@ -62,10 +62,13 @@ class AmpereIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
             raise NotImplementedError(
                 "The DeepSeek-V4.1 SM80 indexer supports no context parallelism."
             )
-        self.indexer_uses_fp4 = indexer_uses_fp4(self.vllm_config)
         # The fused MQA+top-k kernel takes no MXFP4 cache.
         self.fused_mqa_topk_eligible = False
         logger.info_once("DSA indexer on SM80: MXFP4 cache, one decode row per token")
+
+    def _indexer_uses_fp4(self) -> bool:
+        """Always MXFP4, which the stock check accepts on SM100 only."""
+        return indexer_uses_fp4(self.vllm_config)
 
     def build(
         self,

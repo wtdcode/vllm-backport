@@ -127,18 +127,28 @@ class DeepseekV4GroupedWoAWithLoRA(ColumnParallelLinearWithLoRA):
             nope_dim=nope_dim,
             rope_dim=rope_dim,
         )
-        for group in range(n_groups):
+        self.add_grouped_lora(z, x)
+        return z
+
+    def add_grouped_lora(self, z: torch.Tensor, x: torch.Tensor) -> None:
+        """Add the adapter delta in place to the base projection.
+
+        Args:
+            z: `[num_tokens, n_groups, o_lora_rank]` base output.
+            x: `[num_tokens, n_groups, group_dim]` inverse-rotated BF16 input.
+
+        """
+        for group, lora_b in enumerate(self.lora_b_stacked):
             group_output = z[:, group].contiguous()
             self.punica_wrapper.add_lora_linear(
                 group_output,
                 x[:, group].contiguous(),
                 self.lora_a_stacked,
-                (self.lora_b_stacked[group],),
+                (lora_b,),
                 1.0,
-                (o_lora_rank,),
+                (z.shape[2],),
             )
             z[:, group] = group_output
-        return z
 
     @classmethod
     def can_replace_layer(

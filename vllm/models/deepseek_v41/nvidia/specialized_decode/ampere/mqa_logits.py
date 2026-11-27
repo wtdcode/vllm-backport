@@ -85,6 +85,8 @@ WARPS = THREADS // 32
 MAX_HEADS = 64
 # 64-key tiles per CTA of a prefill row: amortizes the query decoding.
 TILES_PER_CTA = 8
+# Rows of one launch: they are its grid's y.
+MAX_ROWS = 65535
 # CTAs per SM a decode launch aims at, for single rows and for row groups
 # (whose CTAs hold the queries of a whole group).
 DECODE_CTAS_PER_SM = 8

@@ -69,6 +69,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
 
     backend_cls = DeepseekV4FlashMLABackend
     swa_backend_cls = DeepseekSparseSWAFlashMLABackend
+    supports_pipeline_relay = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

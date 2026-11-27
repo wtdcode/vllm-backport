@@ -2129,6 +2129,65 @@ def test_grouped_o_projection_applies_each_tokens_adapter(
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA grouped projection")
+def test_grouped_o_projection_sm80_bmm_applies_each_tokens_adapter(
+    default_vllm_config, dist_init
+):
+    """SM80's `_o_proj` multiplies the base `wo_a` weight itself, so it must
+    add the adapter the wrapper holds."""
+    pytest.importorskip("cutlass")
+    from vllm.models.deepseek_v4.common.grouped_wo_a import DeepseekV4GroupedWoA
+    from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere.attention import (
+        DeepseekV41AmpereAttention,
+    )
+
+    torch.manual_seed(0)
+    groups, tokens, columns, outputs, rank = 4, 17, 256, 128, 8
+    config = LoRAConfig(max_loras=2, max_lora_rank=rank, lora_dtype=torch.bfloat16)
+    with torch.device("cuda"), torch.inference_mode():
+        base = DeepseekV4GroupedWoA(
+            columns,
+            groups * outputs,
+            n_groups=groups,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            return_bias=False,
+        )
+        base.weight.copy_(torch.randn_like(base.weight) / columns**0.5)
+        layer = from_layer(base, 2, config, [])
+        punica = get_punica_wrapper(
+            tokens, tokens, base.weight.device, lora_config=config
+        )
+        layer.set_mapping(punica)
+        ids = [i % 3 for i in range(tokens)]
+        punica.update_metadata(LoRAMapping(ids, [1], is_prefill=True), [1, 2], 3, 128)
+        o = torch.randn(tokens, groups * 2, 128, dtype=torch.bfloat16)
+        attn = SimpleNamespace(
+            wo_a=base,
+            n_local_groups=groups,
+            o_lora_rank=outputs,
+            _wo_b_proj=lambda z: z.view(tokens, groups, outputs),
+        )
+        baseline = DeepseekV41AmpereAttention._o_proj(attn, o, None)
+        attn.wo_a = layer
+        expected = baseline.clone()
+        x = o.view(tokens, groups, columns)
+        for slot in range(2):
+            a = torch.randn(rank, columns, dtype=torch.bfloat16) / columns**0.5
+            b = torch.randn(groups * outputs, rank, dtype=torch.bfloat16) / 8
+            layer.set_lora(slot, a, b)
+            delta = torch.bmm(
+                F.linear(x, a).transpose(0, 1),
+                b.view(groups, outputs, rank).transpose(1, 2),
+            ).transpose(0, 1)
+            active = torch.tensor([value == slot + 1 for value in ids])
+            expected[active] += delta[active]
+        actual = DeepseekV41AmpereAttention._o_proj(attn, o, None)
+        torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+        inactive = torch.tensor([value == 0 for value in ids])
+        torch.testing.assert_close(actual[inactive], baseline[inactive], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA grouped projection")
 @pytest.mark.parametrize("tp_rank", [0, 1])
 def test_grouped_o_projection_fully_sharded_applies_full_lora_a(
     default_vllm_config, dist_init, tp_rank

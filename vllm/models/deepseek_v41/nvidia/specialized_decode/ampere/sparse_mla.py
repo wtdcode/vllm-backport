@@ -14,7 +14,8 @@ on dims 448-511 at the token's position, rounded to BF16 (`wo_a`'s input).
 
 Two kernels compute it:
 
-* `SparseMlaPartial` (grid `(splits, tokens, head groups)`, 256 threads)
+* `SparseMlaPartial` (grid `(tokens, splits, head groups)`, 256 threads;
+  tokens on the grid's x, which alone holds a long prefill step's count)
   walks the token's key list in 64-key chunks; CTA `split` takes chunks
   `[split * chunks_per_split, ...)`. Per chunk it decodes the 64 records
   into a BF16 tile in shared memory (codecs.py: two codes at a time, exact),
@@ -296,7 +297,7 @@ class SparseMlaPartial:
             mma_o,
             Storage,
         ).launch(
-            grid=(splits, rows, head_groups),
+            grid=(rows, splits, head_groups),
             block=[THREADS, 1, 1],
             # cute.struct adds size_in_bytes to the class at runtime.
             smem=Storage.size_in_bytes(),  # type: ignore[attr-defined]
@@ -432,7 +433,7 @@ class SparseMlaPartial:
         Storage: cutlass.Constexpr,
     ):
         tid, _, _ = cute.arch.thread_idx()
-        split, row, group = cute.arch.block_idx()
+        row, split, group = cute.arch.block_idx()
         head_rows = self.head_rows
         head0 = group * head_rows
 

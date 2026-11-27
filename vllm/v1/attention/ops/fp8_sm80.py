@@ -45,6 +45,23 @@ except Exception:
     _NATIVE_FP8_CAST = tl.constexpr(False)
 
 
+def native_fp4_cast_supported() -> bool:
+    """Whether Triton kernels may use the hardware e2m1 conversion.
+
+    CUDA has it from SM100 on; other Triton backends keep their own paths.
+    """
+    if not current_platform.is_cuda():
+        return True
+    return current_platform.has_device_capability(100)
+
+
+# Compile-time like `_NATIVE_FP8_CAST`; defaults to the software encoder.
+try:
+    _NATIVE_FP4_CAST = tl.constexpr(native_fp4_cast_supported())
+except Exception:
+    _NATIVE_FP4_CAST = tl.constexpr(False)
+
+
 _E4M3FN_BF16_LUT_CACHE: dict[tuple[torch.device, float | None], torch.Tensor] = {}
 
 
@@ -110,6 +127,28 @@ def _f32_to_e4m3fn_u8(x):
     val = tl.minimum(val, 0x7E)
     val = tl.where(is_nan, 0x7F, val)
     return (val.to(tl.uint8) | sign8).to(tl.uint8)
+
+
+@triton.jit
+def _f32_to_e2m1_u8(x):
+    """fp32 -> e2m1 code (sign bit 3): RNE, saturating to +-6.
+
+    Bit-exact with `cvt.rn.satfinite.e2m1x2.f32` for non-NaN inputs: the
+    magnitude code counts the rounding thresholds below `|x|`, a tie going
+    to the even code; the sign bit follows `x`'s, zero included.
+    """
+    a = tl.abs(x)
+    code = (
+        (a > 0.25).to(tl.uint8)
+        + (a >= 0.75).to(tl.uint8)
+        + (a > 1.25).to(tl.uint8)
+        + (a >= 1.75).to(tl.uint8)
+        + (a > 2.5).to(tl.uint8)
+        + (a >= 3.5).to(tl.uint8)
+        + (a > 5.0).to(tl.uint8)
+    )
+    sign = (x.to(tl.float32).to(tl.uint32, bitcast=True) >> 28) & 8
+    return code | sign.to(tl.uint8)
 
 
 @triton.jit
