@@ -4078,9 +4078,9 @@ nvidia-nvtx==13.2.75 \
     --hash=sha256:b0a85fe36c3e9d56225fc30297577535a5a35f19545c8073926fe89807617e52 \
     --hash=sha256:d8e1c4a14a21d6dd4bc2fc59eb1e3f42447db40edf5d0f580c0eba5f9abb606c
     # via cuda-toolkit
-open-clip-torch==2.32.0 \
-    --hash=sha256:0220bc111162527eb738c1fe20dbfd6ea45dfe44726b54a4de18d3945d8f2f00 \
-    --hash=sha256:80b35b43e37afc2b6173aa5ab0ad68744ab3a3211e624f72dfe743a162707637
+open-clip-torch==4.2.2 \
+    --hash=sha256:307fb2db201cdd62fd5acacf56f11985a1c8241649c97937236c378ac92b4e36 \
+    --hash=sha256:d30675277a727cab0b2faae27b66e0a88afbb020586ece94417a270157f988d4
     # via -r requirements/test/cuda.in
 openai==2.44.0 \
     --hash=sha256:0a2a3ab2e29aeda368700f662ff9ba0f9df17ba4c54577a64e08b8115a3cc0ad \
