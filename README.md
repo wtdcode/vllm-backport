@@ -13,8 +13,8 @@ Status:
 | `DeepSeek-V4-Flash-Vision-Exp` | Native FP4 | `fp8_ds_mla` | Fully Supported (v0.13.0+) |
 | `DeepSeek-V4.1-Flash` | Native FP4 with Engram | `nvfp4_ds_mla` (sm80), `fp8_ds_mla` | Fully Supported (v0.13.0+) |
 | `MiMo-V2.6-Flash` | FP8 | BF16, `fp8` | Fully Supported (v0.14.0+) |
-| `MiniMax-M3.1-Flash` | MXFP8 + NVFP4 | BF16, `fp8` | Supported (v0.14.0+) |
-| `Hy4-Flash` | FP8 | BF16, `fp8_ds_mla` | Supported (v0.14.1+) |
+| `MiniMax-M3.1-Flash` | MXFP8 + NVFP4 | BF16, `fp8` | Fully Supported (v0.14.0+) |
+| `Hy4-Flash` | FP8 | BF16, `fp8_ds_mla` | Fully Supported (v0.14.1+) |
 
 Note we have a paired [LMCache](https://github.com/wtdcode/LMCache/tree/vllm-backport) fork for production kvcache serving, **which is also built into our docke images.**
 
