@@ -735,13 +735,14 @@ def _process_weights_marlin(
     )
 
     # --- Permute scales ---
+    # size_k is each projection's own input dim (hidden for w13).
+    group_size_or_pack_factor = group_size if group_size != -1 else pack_factor
     marlin_w13_scales = marlin_moe_permute_scales(
         s=marlin_w13_scales,
-        size_k=layer.intermediate_size_per_partition,
+        size_k=marlin_w13_scales.shape[1] * group_size_or_pack_factor,
         size_n=marlin_w13_scales.shape[2],
         group_size=group_size,
     )
-    group_size_or_pack_factor = group_size if group_size != -1 else pack_factor
     marlin_w2_scales = marlin_moe_permute_scales(
         s=marlin_w2_scales,
         size_k=marlin_w2_scales.shape[1] * group_size_or_pack_factor,
@@ -847,7 +848,7 @@ def _process_awq_weights_marlin(
 
     marlin_w13_scales = marlin_moe_permute_scales(
         s=w13_scales,
-        size_k=layer.intermediate_size_per_partition,
+        size_k=w13_qweight.shape[1],
         size_n=w13_scales.shape[2],
         group_size=group_size,
     )

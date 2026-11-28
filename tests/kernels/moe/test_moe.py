@@ -1621,6 +1621,72 @@ def test_fused_marlin_moe(
     torch.testing.assert_close(marlin_output, torch_output, atol=4e-2, rtol=0)
 
 
+def _pack_int4_ct(q: torch.Tensor) -> torch.Tensor:
+    """Pack int4 values along the last dim like compressed-tensors."""
+    u = (q + 8).to(torch.int64).unflatten(-1, (-1, 8))
+    shifts = torch.arange(0, 32, 4, device=q.device)
+    return (u << shifts).sum(-1).to(torch.int32)
+
+
+@pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
+@pytest.mark.usefixtures("default_vllm_config")
+@pytest.mark.parametrize("n", [128, 256])
+def test_marlin_moe_ct_weights_with_one_group_per_tp_shard(n: int):
+    """CT W4A16 weights prepared for Marlin match the dequantized weights when
+    a TP shard of the intermediate dim holds one scale group (n == group size):
+    gate/up still have `k / group_size` scale groups."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+        _process_weights_marlin,
+    )
+
+    set_random_seed(0)
+    m, k, e, topk, group_size, dtype = 16, 1024, 8, 2, 128, torch.bfloat16
+    quant_type = scalar_types.uint4b8
+
+    def make(rows: int, cols: int):
+        q = torch.randint(-8, 8, (e, rows, cols), device="cuda")
+        scale = torch.rand((e, rows, cols // group_size), device="cuda") * 4 + 0.2
+        scale = (scale / 80).to(dtype)
+        w_ref = q.to(dtype) * scale.repeat_interleave(group_size, dim=-1)
+        return w_ref, _pack_int4_ct(q), scale
+
+    w1_ref, w1_packed, w1_scale = make(2 * n, k)
+    w2_ref, w2_packed, w2_scale = make(k, n)
+    w1, w2, w1_scale, w2_scale, *_ = _process_weights_marlin(
+        SimpleNamespace(intermediate_size_per_partition=n),
+        num_bits=4,
+        pack_factor=8,
+        group_size=group_size,
+        w13_qweight=w1_packed,
+        w2_qweight=w2_packed,
+        w13_scales=w1_scale,
+        w2_scales=w2_scale,
+    )
+
+    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    score = torch.randn((m, e), device="cuda", dtype=dtype)
+    topk_weights, topk_ids, _ = fused_topk(a, score, topk, False)
+    with set_current_vllm_config(vllm_config):
+        torch_output = torch_moe(a, w1_ref, w2_ref, score, topk)
+    marlin_output = fused_marlin_moe(
+        a,
+        w1,
+        w2,
+        None,
+        None,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        global_num_experts=e,
+        quant_type_id=quant_type.id,
+    )
+
+    torch.testing.assert_close(marlin_output, torch_output, atol=4e-2, rtol=0)
+
+
 @pytest.mark.flaky(reruns=2)
 @pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
 @pytest.mark.usefixtures("default_vllm_config")
