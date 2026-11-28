@@ -22,16 +22,20 @@ Note we have a paired [LMCache](https://github.com/wtdcode/LMCache/tree/vllm-bac
 
 Prebuilt images are published to Docker Hub on every push:
 
-| Image | Target GPUs |
+| Image | Content |
 | --- | --- |
-| `lazymio/vllm-backport:latest-sm86` (also `:latest`) | Ampere sm86 (A6000, RTX 30xx) |
-| `lazymio/vllm-backport:latest-sm80` | Ampere sm80 (A100) |
-| `lazymio/vllm-backport:latest-sm89` | Ada sm89 (RTX 4090, L40S) |
-| `lazymio/vllm-backport:v0.13.0-sm86` / `-sm80` / `-sm89` | pinned release builds |
+| `lazymio/vllm-backport:latest` | latest `master` build |
+| `lazymio/vllm-backport:v0.14.1` | pinned release build |
 
-Images are single-arch builds (no FA3/Hopper kernels), so pick the tag matching your GPU. The entrypoint is `vllm serve` and `lmcache` is also available within the same image!
+One image carries the kernels for sm80 (A100, A800), sm86 (A6000, A40, RTX 30xx) and sm89 (RTX 4090, L20, L40S, RTX 5880 Ada). The older `-sm80` / `-sm86` / `-sm89` tag suffixes are still published and point to the same image. There are no FA3/Hopper kernels. The entrypoint is `vllm serve` and `lmcache` is also available within the same image!
 
-`:latest*` tags track the main branch; each release also ships versioned tags like `:v0.13.0-sm86` if you want to pin. Check [Dockerhub](https://hub.docker.com/r/lazymio/vllm-backport/tags) or [Github](https://github.com/wtdcode/vllm-backport/tags) for available latest tags.
+`:latest` tracks the main branch; each release also ships a versioned tag if you want to pin. Check [Dockerhub](https://hub.docker.com/r/lazymio/vllm-backport/tags) or [Github](https://github.com/wtdcode/vllm-backport/tags) for available tags.
+
+The image is built on CUDA 13.0 (torch 2.14+cu130). Only the host driver has to match, not the CUDA toolkit installed on the host:
+
+- Driver 580 or newer: runs as is.
+- Driver 535 / 550 / 565 / 570 / 575 (`nvidia-smi` reports CUDA 12.x) on datacenter or professional GPUs (A100, A800, A6000, L20, ...): add `-e VLLM_ENABLE_CUDA_COMPATIBILITY=1` to use the CUDA forward-compatibility libraries in the image.
+- Consumer GPUs (RTX 30xx / 40xx) do not support forward compatibility and need driver 580 or newer.
 
 ### Docker Compose Sample
 
