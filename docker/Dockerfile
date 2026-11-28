@@ -670,7 +670,7 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ] && \
 # runtime stages (which have no nvcc) just install the wheel.
 FROM build AS lmcache-build
 ARG LMCACHE_REPO=https://github.com/wtdcode/LMCache.git
-ARG LMCACHE_REF=02072f071fbdc296754b274c1e388483bddabf61
+ARG LMCACHE_REF=48b1e0ed4967467afba4122f1c174bdc00f9ec71
 # Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.
 ARG torch_cuda_arch_list
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
