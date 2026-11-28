@@ -35,10 +35,13 @@ def human_readable_int(value: str) -> int:
     - '1k' -> 1,000
     - '1K' -> 1,024
     - '25.6k' -> 25,600
+    - '11GiB' -> 11 * 2**30 (same as '11G')
 
     """
     value = value.strip()
 
+    # IEC suffixes, as printed by the engine's own memory hints.
+    value = re.sub(r"(?<=\d)([KMGT])iB$", r"\1", value)
     match = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMgGtT])", value)
     if match:
         decimal_multiplier = {

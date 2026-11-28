@@ -577,13 +577,19 @@ def test_scheduler_config_rejects_negative(field):
         ("100", 100),
         ("2.5k", 2_500),
         ("0", 0),
+        ("11GiB", 11 * 2**30),
+        ("512MiB", 512 * 2**20),
+        ("4KiB", 4096),
+        ("1TiB", 2**40),
     ],
 )
 def test_human_readable_int_parses_notation(input_str: str, expected: int):
     assert human_readable_int(input_str) == expected
 
 
-@pytest.mark.parametrize("invalid", ["abc", "1x", "", "k", "1.5K"])
+@pytest.mark.parametrize(
+    "invalid", ["abc", "1x", "", "k", "1.5K", "1.5GiB", "1kiB", "1GB", "GiB"]
+)
 def test_human_readable_int_rejects_invalid(invalid: str):
     with pytest.raises((argparse.ArgumentTypeError, ValueError)):
         human_readable_int(invalid)
