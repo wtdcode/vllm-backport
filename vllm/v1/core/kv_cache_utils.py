@@ -1199,6 +1199,25 @@ def get_kv_cache_capacity(
     return int(max_concurrency * max_model_len), max_concurrency
 
 
+def get_in_flight_blocks_per_request(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> tuple[int, int]:
+    """Blocks of the per-request reservation that only cover in-flight tokens
+    of recycling (e.g. sliding-window) groups, and the reservation itself."""
+    max_model_len = vllm_config.model_config.max_model_len
+    in_flight_blocks = 0
+    total_blocks = 0
+    for group in kv_cache_config.kv_cache_groups:
+        required = group.max_allocated_blocks_per_request(vllm_config)
+        total_blocks += required
+        settled = group.manager_cls.max_admission_blocks(
+            group.manager_config, group.block_size, 0, max_model_len
+        )
+        if settled is not None:
+            in_flight_blocks += max(required - settled, 0)
+    return in_flight_blocks, total_blocks
+
+
 def _kv_cache_device_name(vllm_config: VllmConfig) -> str:
     device_type = vllm_config.device_config.device_type
     return "GPU" if device_type == "cuda" else device_type.upper()
@@ -1223,6 +1242,21 @@ def update_kv_cache_capacity(
         f"{max_model_len:,}",
         max_concurrency,
     )
+    in_flight_blocks, total_blocks = get_in_flight_blocks_per_request(
+        vllm_config, kv_cache_config
+    )
+    if 2 * in_flight_blocks > total_blocks:
+        logger.warning_once(
+            "%d of the %d KV cache blocks reserved per request cover in-flight "
+            "tokens of sliding-window layers (%d concurrent batches x "
+            "max_num_batched_tokens=%d), not context. Lower "
+            "--max-num-batched-tokens or the pipeline parallel size to fit "
+            "more concurrent requests.",
+            in_flight_blocks,
+            total_blocks,
+            vllm_config.max_concurrent_batches,
+            vllm_config.scheduler_config.max_num_batched_tokens,
+        )
 
 
 class BlockHashListWithBlockSize:

@@ -57,6 +57,7 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
     generate_block_hash_extra_keys,
     generate_scheduler_kv_cache_config,
+    get_in_flight_blocks_per_request,
     get_kv_cache_capacity,
     get_max_concurrency_for_kv_cache_config,
     get_request_block_hasher,
@@ -1829,6 +1830,15 @@ def test_get_max_concurrency_for_kv_cache_config():
     )
     assert num_tokens == max_concurrency_hybrid_model * max_model_len
     assert max_concurrency == max_concurrency_hybrid_model
+
+    # In-flight share of the reservation: 64 of the sliding group's 129 blocks
+    # back the one in-flight batch of 1024 tokens.
+    assert get_in_flight_blocks_per_request(
+        vllm_config, kv_cache_config_hybrid_model
+    ) == (64, 1153)
+    assert get_in_flight_blocks_per_request(
+        vllm_config, kv_cache_config_full_attention
+    ) == (0, 1024)
 
     # Unequal group sizes in the standard layout: each group's pages cost
     # whole pool blocks, so a request needs 1024 + 129 = 1153 blocks — the
