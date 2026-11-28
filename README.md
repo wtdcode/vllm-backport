@@ -52,6 +52,8 @@ services:
       - ~/.cache/huggingface:/root/.cache/huggingface
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+      # For PP with all ranks in this container; use a reachable NIC across hosts.
+      # - GLOO_SOCKET_IFNAME=lo
     ipc: host
     restart: unless-stopped
     deploy:
@@ -102,6 +104,7 @@ curl http://localhost:8000/v1/models
     - Pin NCCL with `NCCL_ALGO=Ring NCCL_PROTO=Simple` (and prefer `--disable-custom-all-reduce`). Graph replay must re-issue the exact captured collective; NCCL's size-adaptive algorithm switching is what made FULL capture "crash on Ampere" — Ampere itself is fine.
     - Bound `cudagraph_capture_sizes` as shown. FULL graphs keep private memory pools; capturing every batch size up to `--max-num-seqs` can cost >800 MB per GPU and OOM warmup at high `--gpu-memory-utilization`.
 - Adjust your TP (--tensor-parallel-size), PP (--pipeline-parallel-size) and EP (--enable-expert-parallel) accordingly.
+- For PP inside a single container: if decode slows sharply at long context while the GPUs sit idle, check the Gloo control plane ([#111](https://github.com/wtdcode/vllm-backport/issues/111)). Setting `GLOO_SOCKET_IFNAME=lo` in the `vllm` service's environment keeps the rank-to-rank control messages on loopback. Not every host needs it (no difference measured on our 4x A100 box with default bridge networking). For PP across hosts use an interface reachable from every host instead of `lo`.
 
 ### Model Specific setups
 
