@@ -202,7 +202,6 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_PLE_CPU_OFFLOAD: bool = True
-    VLLM_MHC_AR_INT8: bool = False
     VLLM_UNREPLICATE_ATTN_GEMMS_ALL_LAYERS: bool = True
     VLLM_INDEXER_DECODE_SHARD_MIN_REQS: int = 4
     VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
@@ -1711,18 +1710,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Legacy alias of `--engram-config.cpu_offload` (upstream dropped it in
     # #57937 when host offload became the default); kept for fork recipes.
     "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "1"))),
-    # Transport the prefill all-reduce as int8 blockwise-32 instead of bf16,
-    # using the custom two-shot with dequant-sum-requant in kernel, and have
-    # mhc_post consume the quantized form so phase 2 never has to widen back to
-    # bf16. Halves the wire: the collective measures 0.619x today's NCCL path at
-    # the 64 MiB prefill payload, and mhc_post gets cheaper too (d falls from
-    # 8 KB/token to 4.25 KB). Prefill only -- decode ARs are latency-bound, and
-    # the mhc_post boundary dispatches on dtype because decode reaches it from
-    # three concurrent sequences onward and stays bf16 there.
-    # NOT numerics-preserving: 3.10x bf16's own error per all-reduce, measured
-    # on real activations with both roundings; see the int8-AR section of
-    # benchmarks/kernels/dsv4_sm80_refutations.md.
-    "VLLM_MHC_AR_INT8": lambda: os.environ.get("VLLM_MHC_AR_INT8", "0") == "1",
     # Whether the shard above also covers the layers that have no merged input
     # trio. `fused_wqa_wkv` is replicated on all 43 attention layers, but the
     # shard used to sit inside the `fused_input_weight is not None` branch --

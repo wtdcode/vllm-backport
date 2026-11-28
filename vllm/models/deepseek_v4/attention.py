@@ -17,7 +17,6 @@ from vllm.model_executor.kernels.linear.gemv_triton import (
     bf16_gemv,
     should_use_triton_gemv,
 )
-from vllm.model_executor.kernels.mhc.ar_int8 import ar_hoisted
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -323,17 +322,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.n_local_groups
-        # When the all-reduce is hoisted (task #35) the decoder layer performs it,
-        # so this layer must not. Same predicate as the MoE half -- the suppressed
-        # set and the re-added set are derived from one source, never two.
-        self._ar_hoisted = ar_hoisted(vllm_config)
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
             return_bias=False,
-            reduce_results=not self._ar_hoisted,
             prefix=f"{prefix}.wo_b",
         )
 
