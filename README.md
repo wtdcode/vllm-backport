@@ -139,6 +139,7 @@ vllm serve wtdcode/GLM-5.3-Flash-AWQ-W4A16 \
 
 ```bash
 VLLM_PLE_CPU_OFFLOAD=1 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+PYTORCH_CUDA_ALLOC_CONF=pinned_max_round_threshold_mb:4096
 vllm serve /path/to/your/qwen3.8 \
   --host=0.0.0.0 \
   --port=19088 \
@@ -163,6 +164,7 @@ vllm serve /path/to/your/qwen3.8 \
 ```
 
 - `VLLM_PLE_CPU_OFFLOAD=1` keeps the 51B n-gram embedding (fp8, ~51 GiB) in pinned host RAM via a separate `PleOffloadWorker` process. Without it the TP-sharded embedding adds ~12.8 GiB per GPU and KV memory goes negative on 48 GB cards.
+- `PYTORCH_CUDA_ALLOC_CONF=pinned_max_round_threshold_mb:4096` stops PyTorch from rounding the pinned host allocation of the offloaded n-gram table up to the next power of two per TP rank. On 4x A100 (TP4) it lowers pinned host memory from 129.6 GiB to 98.0 GiB with the AWQ checkpoint (BF16 table); the FP8 checkpoint pins 64.4 GiB without it.
 - `--enable-expert-parallel` is required, not optional: with plain TP the 640-wide expert intermediate becomes 160 per rank, which is not a multiple of the 128x128 fp8 block, and vLLM then forces the Triton fp8 MoE kernel (no fp8 tensor cores on sm86). With EP the experts stay whole and the Marlin W8A16 backend is used.
 - LMCache: the unified KV block size is 800, so `--chunk-size` must be a multiple of 800 (use `--chunk-size 800 --separate-object-groups`), and add `--prefix-cache-retention-interval 800 --max-num-batched-tokens 800` to `vllm serve` (same MTP + align-mode rule as GLM-5.3-Flash).
 - AWQ W4A16 ([`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16), compressed-tensors `pack-quantized`, routed experts INT4 g128, everything else BF16): MTP speculative decoding works (the BF16 MTP draft is kept unquantized automatically). Verified on 4x A100-80GB: `VLLM_PLE_CPU_OFFLOAD=1 vllm serve wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --tensor-parallel-size 4 --enable-expert-parallel --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' --speculative-config '{"method":"mtp","num_speculative_tokens":3}'`. This achieves up to 936 tps.
