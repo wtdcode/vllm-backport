@@ -342,8 +342,6 @@ if TYPE_CHECKING:
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_DETERMINISTIC_MOE_ALIGN: bool = False
     VLLM_DISABLE_MULTI_STREAM_PARALLEL: bool = False
-    VLLM_MHC_POST_FUSE_SQRSUM: bool = False
-    VLLM_MHC_PRENORM_SHARD: bool = False
     VLLM_DSV41_SM80_TRITON: bool = False
     VLLM_UNREPLICATE_ATTN_GEMMS: bool = False
     VLLM_INDEXER_QUERY_SHARD: bool = False
@@ -2437,23 +2435,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to run serially on the default stream (no aux-stream overlap).
     "VLLM_DISABLE_MULTI_STREAM_PARALLEL": lambda: bool(
         int(os.getenv("VLLM_DISABLE_MULTI_STREAM_PARALLEL", "0"))
-    ),
-    # Fold the mHC prenorm GEMM's companion row-sqrsum into mhc_post, which
-    # already holds those values in registers, instead of running it as a
-    # second pass over the post-mapped residual. Prefill-shaped only: it takes
-    # effect where the prenorm GEMM routes to cuBLAS (>= 32 tokens), and the
-    # pass it removes is a full num_tokens x hc_mult x hidden bf16 read.
-    "VLLM_MHC_POST_FUSE_SQRSUM": lambda: (
-        os.environ.get("VLLM_MHC_POST_FUSE_SQRSUM", "0") == "1"
-    ),
-    # Divide the mHC prenorm GEMM's rows across TP ranks and all-gather its
-    # output, instead of every rank computing every row. The residual stays
-    # replicated -- this splits the work, not the data, so no input collective
-    # is needed. It pays because the GEMM reduces 16384 -> 24: each rank reads
-    # 1/TP of a 256 MB residual and the gather carries only 0.68 MB. Only the
-    # cuBLAS route shards; below the token threshold the replicated path runs.
-    "VLLM_MHC_PRENORM_SHARD": lambda: (
-        os.environ.get("VLLM_MHC_PRENORM_SHARD", "0") == "1"
     ),
     # Route DeepSeek-V4.1 on SM80 through the SM86/SM89 Triton sparse-MLA
     # path (fp8_ds_mla KV layout) instead of upstream's A100 CuTe DSL kernels.
